@@ -8,8 +8,9 @@ from dotenv import load_dotenv
 import pymongo
 import psycopg2
 from psycopg2.extras import RealDictCursor
-from fastapi import FastAPI, HTTPException
+import streamlit as st
 from pydantic import BaseModel
+
 import groq
 from langchain.schema import BaseMessage, HumanMessage, AIMessage
 from langchain.prompts import PromptTemplate
@@ -17,6 +18,7 @@ from langchain_groq import ChatGroq
 from langgraph.graph import StateGraph, END
 from langgraph.graph.message import add_messages
 from typing_extensions import TypedDict, Annotated
+
 import logging
 import re
 
@@ -38,11 +40,11 @@ load_dotenv()
 class Config:
     GROQ_API_KEY = os.getenv("GROQ_API_KEY")
     MONGODB_URL = os.getenv("MONGODB_URL", "mongodb://localhost:27017")
-    POSTGRES_URL = os.getenv("POSTGRES_URL", "postgresql://user:password@localhost:5432/dbname")
+    POSTGRES_URL: Optional[str] = os.getenv("POSTGRES_URL")
     DATABASE_NAME = os.getenv("DATABASE_NAME", "rag_chatbot")
     GROQ_MODEL = os.getenv("GROQ_MODEL", "llama3-8b-8192")
 
-# Pydantic models
+# Pydantic models (used for data structure, not for FastAPI)
 class ChatRequest(BaseModel):
     message: str
     session_id: Optional[str] = None
@@ -60,6 +62,8 @@ class DatabaseManager:
         self.sessions_collection = self.mongo_db.sessions
         
     def get_postgres_connection(self):
+        if not Config.POSTGRES_URL:
+            raise ValueError("PostgreSQL URL is not configured.")
         return psycopg2.connect(Config.POSTGRES_URL, cursor_factory=RealDictCursor)
     
     def save_session(self, session_id: str, message: str, response: str, query_type: str):
@@ -83,11 +87,12 @@ class SchemaInspector:
         self.db_manager = db_manager
         self._schema_cache = None
     
-    def get_schema_info(self) -> Dict[str, Any]:
-        if self._schema_cache:
-            return self._schema_cache
+    @st.cache_data(ttl=600)
+    def get_schema_info(_self) -> Dict[str, Any]:
+        if _self._schema_cache:
+            return _self._schema_cache
             
-        with self.db_manager.get_postgres_connection() as conn:
+        with _self.db_manager.get_postgres_connection() as conn:
             cursor = conn.cursor()
             
             # Get all tables
@@ -109,10 +114,10 @@ class SchemaInspector:
                 columns = cursor.fetchall()
                 schema_info[table] = {
                     'columns': columns,
-                    'sample_data': self._get_sample_data(cursor, table)
+                    'sample_data': _self._get_sample_data(cursor, table)
                 }
         
-        self._schema_cache = schema_info
+        _self._schema_cache = schema_info
         return schema_info
     
     def _get_sample_data(self, cursor, table_name: str) -> List[Dict]:
@@ -371,17 +376,25 @@ What would you like to know about your data?"""
                     state["final_response"] = f"Result: {data[0][columns[0]]}"
                 else:
                     # Multiple rows/columns
-                    response = f"Found {results['row_count']} result(s):\n\n"
-                    for row in data[:10]:  # Limit to 10 rows
-                        row_str = []
-                        for col in columns:
-                            row_str.append(f"{col}: {row[col]}")
-                        response += "- " + ", ".join(row_str) + "\n"
-                    
-                    if results["row_count"] > 10:
-                        response += f"\n... and {results['row_count'] - 10} more rows"
-                    
-                    state["final_response"] = response
+                    if data and columns:
+                        response_parts = [f"Found {results['row_count']} result(s):"]
+                        
+                        # Create a markdown table
+                        header = f"| {' | '.join(columns)} |"
+                        separator = f"| {' | '.join(['---'] * len(columns))} |"
+                        response_parts.append(header)
+                        response_parts.append(separator)
+
+                        for row in data[:10]:  # Limit to 10 rows
+                            row_str = [str(row[col]) for col in columns]
+                            response_parts.append(f"| {' | '.join(row_str)} |")
+                        
+                        if results['row_count'] > 10:
+                            response_parts.append(f"\n... and {results['row_count'] - 10} more rows.")
+
+                        state["final_response"] = "\n".join(response_parts)
+                    else:
+                        state["final_response"] = "No data found or columns are missing."
         
         return state
     
@@ -417,26 +430,68 @@ What would you like to know about your data?"""
             "query_type": final_state["query_type"]
         }
 
-# FastAPI app
-app = FastAPI(title="RAG SQL Agent Chatbot", version="1.0.0")
-agent = SQLAgent()
+def show_db_config_form():
+    st.header("Configure Database Connection")
+    with st.form("db_config_form"):
+        host = st.text_input("Host", value="localhost")
+        port = st.number_input("Port", value=5432)
+        username = st.text_input("Username", value="user")
+        password = st.text_input("Password", type="password", value="password")
+        database = st.text_input("Database", value="dbname")
+        
+        submitted = st.form_submit_button("Connect")
+        if submitted:
+            postgres_url = f"postgresql://{username}:{password}@{host}:{port}/{database}"
+            try:
+                with st.spinner("Connecting to database..."):
+                    conn = psycopg2.connect(postgres_url)
+                    conn.close()
+                
+                st.success("Database connection successful!")
+                Config.POSTGRES_URL = postgres_url
+                st.session_state.db_connected = True
+                st.session_state.agent = SQLAgent()
+                st.rerun()
 
-@app.post("/chat", response_model=ChatResponse)
-async def chat(request: ChatRequest):
-    try:
-        result = agent.process_message(request.message, request.session_id)
-        return ChatResponse(**result)
-    except Exception as e:
-        raise HTTPException(status_code=500, detail=str(e))
+            except Exception as e:
+                st.error(f"Database connection failed: {e}")
 
-@app.get("/health")
-async def health_check():
-    return {"status": "healthy"}
+def show_chat_interface():
+    st.title("RAG SQL Agent Chatbot")
 
-@app.get("/schema")
-async def get_schema():
-    return agent.schema_inspector.get_schema_info()
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+    if "session_id" not in st.session_state:
+        st.session_state.session_id = str(uuid.uuid4())
+
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+    if prompt := st.chat_input("Ask a question about your data..."):
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        with st.chat_message("assistant"):
+            with st.spinner("Thinking..."):
+                agent = st.session_state.agent
+                result = agent.process_message(prompt, st.session_state.session_id)
+                response = result["response"]
+                st.markdown(response)
+        
+        st.session_state.messages.append({"role": "assistant", "content": response})
+
+def main():
+    st.set_page_config(page_title="Bisee Chatbot", layout="wide")
+
+    if "db_connected" not in st.session_state:
+        st.session_state.db_connected = False
+
+    if not st.session_state.db_connected:
+        show_db_config_form()
+    else:
+        show_chat_interface()
 
 if __name__ == "__main__":
-    import uvicorn
-    uvicorn.run(app, host="0.0.0.0", port=8000)
+    main()
