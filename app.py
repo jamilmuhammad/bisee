@@ -4,6 +4,9 @@ from datetime import datetime
 from typing import Dict, List, Optional, Any
 from dataclasses import dataclass
 from dotenv import load_dotenv
+import json
+import base64
+from io import BytesIO
 
 import pymongo
 import psycopg2
@@ -21,6 +24,12 @@ from typing_extensions import TypedDict, Annotated
 
 import logging
 import re
+
+# Visualization imports
+import matplotlib.pyplot as plt
+import seaborn as sns
+import pandas as pd
+import numpy as np
 
 # Configure logging
 logging.basicConfig(
@@ -44,7 +53,7 @@ class Config:
     DATABASE_NAME = os.getenv("DATABASE_NAME", "rag_chatbot")
     GROQ_MODEL = os.getenv("GROQ_MODEL", "llama3-8b-8192")
 
-# Pydantic models (used for data structure, not for FastAPI)
+# Pydantic models for structured responses
 class ChatRequest(BaseModel):
     message: str
     session_id: Optional[str] = None
@@ -53,6 +62,18 @@ class ChatResponse(BaseModel):
     response: str
     session_id: str
     query_type: str
+    generated_sql: Optional[str] = None
+    data_query_result: Optional[Dict[str, Any]] = None
+    markdown_result: Optional[str] = None
+    visualization_result: Optional[str] = None  # Base64 encoded image
+
+class VisualizationRequest(BaseModel):
+    chart_type: str
+    data: List[Dict[str, Any]]
+    columns: List[str]
+    title: str
+    x_axis: Optional[str] = None
+    y_axis: Optional[str] = None
 
 # Database connections
 class DatabaseManager:
@@ -80,6 +101,35 @@ class DatabaseManager:
         return list(self.sessions_collection.find(
             {"session_id": session_id}
         ).sort("timestamp", -1).limit(limit))
+
+# Query Executor
+class QueryExecutor:
+    def __init__(self, db_manager: DatabaseManager):
+        self.db_manager = db_manager
+    
+    def execute_query(self, query: str) -> Dict[str, Any]:
+        try:
+            with self.db_manager.get_postgres_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(query)
+                
+                results = cursor.fetchall()
+                column_names = [desc[0] for desc in cursor.description]
+                
+                return {
+                    "success": True,
+                    "data": results,
+                    "columns": column_names,
+                    "row_count": len(results)
+                }
+        except Exception as e:
+            return {
+                "success": False,
+                "error": str(e),
+                "data": [],
+                "columns": [],
+                "row_count": 0
+            }
 
 # Database Schema Inspector
 class SchemaInspector:
@@ -127,21 +177,48 @@ class SchemaInspector:
         except:
             return []
 
-# SQL Query Generator
-class SQLQueryGenerator:
-    def __init__(self, llm: ChatGroq, schema_info: Dict[str, Any]):
-        self.llm = llm
-        self.schema_info = schema_info
-        
-        self.query_template = PromptTemplate(
+# Prompt Templates for different agents
+class PromptTemplates:
+    @staticmethod
+    def get_router_prompt():
+        return PromptTemplate(
+            input_variables=["user_input", "context"],
+            template="""
+You are a query router that classifies user inputs into different categories.
+
+Categories:
+1. "sql_query" - Questions about data analysis, counts, statistics, reports, or database queries
+2. "visualization" - Requests for charts, graphs, plots, or visual representations
+3. "general" - General questions, greetings, or unclear requests
+
+Context from previous conversation:
+{context}
+
+User Input: {user_input}
+
+Based on the user input, classify this into one of the three categories above.
+Look for keywords like:
+- SQL: "count", "how many", "show", "list", "average", "sum", "total", "find", "data"
+- Visualization: "chart", "graph", "plot", "visualize", "show chart", "bar chart", "pie chart"
+- General: greetings, unclear requests, non-data related questions
+
+Return only the category name: sql_query, visualization, or general
+"""
+        )
+
+    @staticmethod
+    def get_sql_generator_prompt():
+        return PromptTemplate(
             input_variables=["user_input", "schema_info", "context"],
             template="""
-You are a SQL query generator. Generate ONLY safe SELECT queries for PostgreSQL based on the user input and database schema.
+You are an expert SQL query generator for PostgreSQL. Generate safe, efficient SELECT queries only.
 
-STRICT LIMITATIONS:
-- ONLY SELECT queries allowed (no INSERT, UPDATE, DELETE, DROP, ALTER, etc.)
-- Only simple operations: COUNT, AVG, SUM, MIN, MAX, basic WHERE clauses
-- No complex JOINs, subqueries, or window functions
+STRICT RULES:
+- ONLY SELECT queries (no INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, etc.)
+- Use proper PostgreSQL syntax
+- Include appropriate WHERE clauses, ORDER BY, LIMIT as needed
+- Use aggregate functions (COUNT, SUM, AVG, MIN, MAX) when appropriate
+- No complex subqueries or CTEs unless absolutely necessary
 - No user-defined functions or stored procedures
 
 Database Schema:
@@ -150,35 +227,398 @@ Database Schema:
 Previous Context:
 {context}
 
-User Input: {user_input}
+User Request: {user_input}
 
-Generate a safe SQL query that answers the user's question. If the request is not supported, respond with "UNSUPPORTED_QUERY".
+Generate a clean, executable SQL query that answers the user's question.
+If the request cannot be fulfilled safely, return "UNSUPPORTED_QUERY".
 
-SQL Query:
+Return only the SQL query without any formatting or explanation.
 """
         )
+
+    @staticmethod
+    def get_reflection_prompt():
+        return PromptTemplate(
+            input_variables=["user_input", "sql_query", "query_results", "current_response"],
+            template="""
+You are a reflection agent that reviews and improves responses for accuracy and completeness.
+
+User Question: {user_input}
+Generated SQL: {sql_query}
+Query Results: {query_results}
+Current Response: {current_response}
+
+Review the current response and provide feedback on:
+1. Accuracy - Does it correctly answer the user's question?
+2. Completeness - Are all aspects of the question addressed?
+3. Clarity - Is the response clear and understandable?
+4. Data interpretation - Are the results properly interpreted?
+
+Provide specific feedback and suggestions for improvement.
+If the response is good, simply return "APPROVED".
+"""
+        )
+
+    @staticmethod
+    def get_response_refiner_prompt():
+        return PromptTemplate(
+            input_variables=["user_input", "sql_query", "query_results", "current_response", "reflection_feedback"],
+            template="""
+You are a response refinement agent that improves responses based on reflection feedback.
+
+User Question: {user_input}
+Generated SQL: {sql_query}
+Query Results: {query_results}
+Current Response: {current_response}
+Reflection Feedback: {reflection_feedback}
+
+Based on the reflection feedback, create an improved, more accurate and precise response.
+Make sure to:
+1. Address all points raised in the feedback
+2. Provide clear, actionable insights
+3. Use proper formatting and structure
+4. Include relevant context and explanations
+
+Return the refined response:
+"""
+        )
+
+    @staticmethod
+    def get_visualization_prompt():
+        return PromptTemplate(
+            input_variables=["user_input", "query_results", "columns"],
+            template="""
+You are a visualization recommendation agent that suggests appropriate chart types based on data.
+
+User Request: {user_input}
+Query Results: {query_results}
+Available Columns: {columns}
+
+Based on the data and user request, recommend the best visualization type and configuration.
+
+Available chart types:
+- bar: For categorical data comparison
+- line: For time series or trend data
+- pie: For proportional data (max 10 categories)
+- scatter: For correlation between two variables
+- histogram: For distribution of numerical data
+
+Return a JSON object with:
+{{
+    "chart_type": "bar|line|pie|scatter|histogram",
+    "title": "Chart title",
+    "x_axis": "column name for x-axis",
+    "y_axis": "column name for y-axis",
+    "description": "Brief description of what the chart shows"
+}}
+"""
+        )
+
+    @staticmethod
+    def get_general_response_prompt():
+        return PromptTemplate(
+            input_variables=["user_input", "available_tables", "context"],
+            template="""
+You are a helpful database assistant that provides general information and guidance.
+
+User Input: {user_input}
+Available Tables: {available_tables}
+Context: {context}
+
+Provide a helpful response that:
+1. Addresses the user's question or comment
+2. Offers guidance on what they can do with the available data
+3. Suggests example queries they might find useful
+4. Maintains a friendly, professional tone
+
+If the user is greeting you, respond appropriately and explain your capabilities.
+"""
+        )
+
+# Enhanced LangGraph State
+class AgentState(TypedDict):
+    messages: Annotated[List[BaseMessage], add_messages]
+    user_input: str
+    session_id: str
+    query_type: str
+    context: str
+    sql_query: str
+    query_results: Dict[str, Any]
+    final_response: str
+    # New fields for enhanced response
+    generated_sql: Optional[str]
+    data_query_result: Optional[Dict[str, Any]]
+    markdown_result: Optional[str]
+    visualization_result: Optional[str]
+    reflection_feedback: Optional[str]
+    refined_response: Optional[str]
+    chart_type: Optional[str]
+    visualization_data: Optional[Dict[str, Any]]
+
+# Database Schema Inspector
+class SchemaInspector:
+    def __init__(self, db_manager: DatabaseManager):
+        self.db_manager = db_manager
+        self._schema_cache = None
+    
+    @st.cache_data(ttl=600)
+    def get_schema_info(_self) -> Dict[str, Any]:
+        if _self._schema_cache:
+            return _self._schema_cache
+            
+        with _self.db_manager.get_postgres_connection() as conn:
+            cursor = conn.cursor()
+            
+            # Get all tables
+            cursor.execute("""
+                SELECT table_name 
+                FROM information_schema.tables 
+                WHERE table_schema = 'public'
+            """)
+            tables = [row['table_name'] for row in cursor.fetchall()]
+            
+            schema_info = {}
+            for table in tables:
+                cursor.execute(f"""
+                    SELECT column_name, data_type, is_nullable, column_default
+                    FROM information_schema.columns 
+                    WHERE table_name = '{table}'
+                    ORDER BY ordinal_position
+                """)
+                columns = cursor.fetchall()
+                schema_info[table] = {
+                    'columns': columns,
+                    'sample_data': _self._get_sample_data(cursor, table)
+                }
+        
+        _self._schema_cache = schema_info
+        return schema_info
+    
+    def _get_sample_data(self, cursor, table_name: str) -> List[Dict]:
+        try:
+            cursor.execute(f"SELECT * FROM {table_name} LIMIT 3")
+            return cursor.fetchall()
+        except:
+            return []
+
+# Prompt Templates for different agents
+class PromptTemplates:
+    @staticmethod
+    def get_router_prompt():
+        return PromptTemplate(
+            input_variables=["user_input", "context"],
+            template="""
+You are a query router that classifies user inputs into different categories.
+
+Categories:
+1. "sql_query" - Questions about data analysis, counts, statistics, reports, or database queries
+2. "visualization" - Requests for charts, graphs, plots, or visual representations
+3. "general" - General questions, greetings, or unclear requests
+
+Context from previous conversation:
+{context}
+
+User Input: {user_input}
+
+Based on the user input, classify this into one of the three categories above.
+Look for keywords like:
+- SQL: "count", "how many", "show", "list", "average", "sum", "total", "find", "data"
+- Visualization: "chart", "graph", "plot", "visualize", "show chart", "bar chart", "pie chart"
+- General: greetings, unclear requests, non-data related questions
+
+Return only the category name: sql_query, visualization, or general
+"""
+        )
+
+    @staticmethod
+    def get_sql_generator_prompt():
+        return PromptTemplate(
+            input_variables=["user_input", "schema_info", "context"],
+            template="""
+You are an expert SQL query generator for PostgreSQL. Generate safe, efficient SELECT queries only.
+
+STRICT RULES:
+- ONLY SELECT queries (no INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, etc.)
+- Use proper PostgreSQL syntax
+- Include appropriate WHERE clauses, ORDER BY, LIMIT as needed
+- Use aggregate functions (COUNT, SUM, AVG, MIN, MAX) when appropriate
+- No complex subqueries or CTEs unless absolutely necessary
+- No user-defined functions or stored procedures
+
+Database Schema:
+{schema_info}
+
+Previous Context:
+{context}
+
+User Request: {user_input}
+
+Generate a clean, executable SQL query that answers the user's question.
+If the request cannot be fulfilled safely, return "UNSUPPORTED_QUERY".
+
+Return only the SQL query without any formatting or explanation.
+"""
+        )
+
+    @staticmethod
+    def get_reflection_prompt():
+        return PromptTemplate(
+            input_variables=["user_input", "sql_query", "query_results", "current_response"],
+            template="""
+You are a reflection agent that reviews and improves responses for accuracy and completeness.
+
+User Question: {user_input}
+Generated SQL: {sql_query}
+Query Results: {query_results}
+Current Response: {current_response}
+
+Review the current response and provide feedback on:
+1. Accuracy - Does it correctly answer the user's question?
+2. Completeness - Are all aspects of the question addressed?
+3. Clarity - Is the response clear and understandable?
+4. Data interpretation - Are the results properly interpreted?
+
+Provide specific feedback and suggestions for improvement.
+If the response is good, simply return "APPROVED".
+"""
+        )
+
+    @staticmethod
+    def get_response_refiner_prompt():
+        return PromptTemplate(
+            input_variables=["user_input", "sql_query", "query_results", "current_response", "reflection_feedback"],
+            template="""
+You are a response refinement agent that improves responses based on reflection feedback.
+
+User Question: {user_input}
+Generated SQL: {sql_query}
+Query Results: {query_results}
+Current Response: {current_response}
+Reflection Feedback: {reflection_feedback}
+
+Based on the reflection feedback, create an improved, more accurate and precise response.
+Make sure to:
+1. Address all points raised in the feedback
+2. Provide clear, actionable insights
+3. Use proper formatting and structure
+4. Include relevant context and explanations
+
+Return the refined response:
+"""
+        )
+
+    @staticmethod
+    def get_visualization_prompt():
+        return PromptTemplate(
+            input_variables=["user_input", "query_results", "columns"],
+            template="""
+You are a visualization recommendation agent that suggests appropriate chart types based on data.
+
+User Request: {user_input}
+Query Results: {query_results}
+Available Columns: {columns}
+
+Based on the data and user request, recommend the best visualization type and configuration.
+
+Available chart types:
+- bar: For categorical data comparison
+- line: For time series or trend data
+- pie: For proportional data (max 10 categories)
+- scatter: For correlation between two variables
+- histogram: For distribution of numerical data
+
+Return a JSON object with:
+{{
+    "chart_type": "bar|line|pie|scatter|histogram",
+    "title": "Chart title",
+    "x_axis": "column name for x-axis",
+    "y_axis": "column name for y-axis",
+    "description": "Brief description of what the chart shows"
+}}
+"""
+        )
+
+    @staticmethod
+    def get_general_response_prompt():
+        return PromptTemplate(
+            input_variables=["user_input", "available_tables", "context"],
+            template="""
+You are a helpful database assistant that provides general information and guidance.
+
+User Input: {user_input}
+Available Tables: {available_tables}
+Context: {context}
+
+Provide a helpful response that:
+1. Addresses the user's question or comment
+2. Offers guidance on what they can do with the available data
+3. Suggests example queries they might find useful
+4. Maintains a friendly, professional tone
+
+If the user is greeting you, respond appropriately and explain your capabilities.
+"""
+        )
+
+# Enhanced LangGraph State
+class AgentState(TypedDict):
+    messages: Annotated[List[BaseMessage], add_messages]
+    user_input: str
+    session_id: str
+    query_type: str
+    context: str
+    sql_query: str
+    query_results: Dict[str, Any]
+    final_response: str
+    # New fields for enhanced response
+    generated_sql: Optional[str]
+    data_query_result: Optional[Dict[str, Any]]
+    markdown_result: Optional[str]
+    visualization_result: Optional[str]
+    reflection_feedback: Optional[str]
+    refined_response: Optional[str]
+    chart_type: Optional[str]
+    visualization_data: Optional[Dict[str, Any]]
+
+# SQL Query Generator
+class SQLQueryGenerator:
+    def __init__(self, llm: ChatGroq, schema_info: Dict[str, Any]):
+        self.llm = llm
+        self.schema_info = schema_info
+        self.query_prompt = PromptTemplates.get_sql_generator_prompt()
     
     def generate_query(self, user_input: str, context: str = "") -> str:
         schema_str = self._format_schema()
         
-        prompt = self.query_template.format(
+        prompt = self.query_prompt.format(
             user_input=user_input,
             schema_info=schema_str,
             context=context
         )
         
         response = self.llm.invoke(prompt)
-        query = response.content.strip().split("\nSQL Query:")[-1].strip()
-        match = re.search(r"```sql\n(.*?)\n```", query, re.DOTALL)
-        sql_query = match.group(1).strip() if match else None
-
-        logger.info(f"Generated SQL Query: {sql_query}")
+        query = response.content.strip()
+        
+        # Clean up the query
+        query = self._clean_query(query)
+        
+        logger.info(f"Generated SQL Query: {query}")
         
         # Validate query safety
-        if not self._is_safe_query(sql_query):
+        if not self._is_safe_query(query):
             return "UNSUPPORTED_QUERY"
             
-        return sql_query if sql_query else "UNSUPPORTED_QUERY"
+        return query if query else "UNSUPPORTED_QUERY"
+    
+    def _clean_query(self, query: str) -> str:
+        """Clean and format the SQL query"""
+        # Remove markdown formatting
+        query = re.sub(r'```sql\n(.*?)\n```', r'\1', query, flags=re.DOTALL)
+        query = re.sub(r'```\n(.*?)\n```', r'\1', query, flags=re.DOTALL)
+        
+        # Remove extra whitespace
+        query = ' '.join(query.split())
+        
+        return query.strip()
     
     def _format_schema(self) -> str:
         schema_str = ""
@@ -193,7 +633,7 @@ SQL Query:
     
     def _is_safe_query(self, query: str) -> bool:
         query_upper = query.upper().strip()
-        
+
         # Must start with SELECT
         if not query_upper.startswith("SELECT"):
             return False
@@ -211,49 +651,183 @@ SQL Query:
         
         return True
 
-# Query Executor
-class QueryExecutor:
-    def __init__(self, db_manager: DatabaseManager):
-        self.db_manager = db_manager
+# Reflection Agent
+class ReflectionAgent:
+    def __init__(self, llm: ChatGroq):
+        self.llm = llm
+        self.reflection_prompt = PromptTemplates.get_reflection_prompt()
+        self.refiner_prompt = PromptTemplates.get_response_refiner_prompt()
     
-    def execute_query(self, query: str) -> Dict[str, Any]:
+    def reflect_on_response(self, user_input: str, sql_query: str, query_results: Dict[str, Any], current_response: str) -> str:
+        """Reflect on the current response and provide feedback"""
+        prompt = self.reflection_prompt.format(
+            user_input=user_input,
+            sql_query=sql_query,
+            query_results=str(query_results),
+            current_response=current_response
+        )
+        
+        response = self.llm.invoke(prompt)
+        return response.content.strip()
+    
+    def refine_response(self, user_input: str, sql_query: str, query_results: Dict[str, Any], 
+                       current_response: str, reflection_feedback: str) -> str:
+        """Refine the response based on reflection feedback"""
+        if reflection_feedback.strip() == "APPROVED":
+            return current_response
+        
+        prompt = self.refiner_prompt.format(
+            user_input=user_input,
+            sql_query=sql_query,
+            query_results=str(query_results),
+            current_response=current_response,
+            reflection_feedback=reflection_feedback
+        )
+        
+        response = self.llm.invoke(prompt)
+        return response.content.strip()
+
+# Visualization Agent
+class VisualizationAgent:
+    def __init__(self, llm: ChatGroq):
+        self.llm = llm
+        self.viz_prompt = PromptTemplates.get_visualization_prompt()
+        
+    def generate_chart_config(self, user_input: str, query_results: Dict[str, Any]) -> Dict[str, Any]:
+        """Generate chart configuration based on query results"""
+        if not query_results.get("success") or not query_results.get("data"):
+            return {"error": "No data available for visualization"}
+        
+        data = query_results["data"]
+        columns = query_results["columns"]
+        
+        prompt = self.viz_prompt.format(
+            user_input=user_input,
+            query_results=str(data[:5]),  # First 5 rows for analysis
+            columns=str(columns)
+        )
+        
         try:
-            with self.db_manager.get_postgres_connection() as conn:
-                cursor = conn.cursor()
-                cursor.execute(query)
-                
-                results = cursor.fetchall()
-                column_names = [desc[0] for desc in cursor.description]
-                
-                return {
-                    "success": True,
-                    "data": results,
-                    "columns": column_names,
-                    "row_count": len(results)
-                }
+            response = self.llm.invoke(prompt)
+            config = json.loads(response.content.strip())
+            return config
         except Exception as e:
-            return {
-                "success": False,
-                "error": str(e),
-                "data": [],
-                "columns": [],
-                "row_count": 0
-            }
+            logger.error(f"Error generating chart config: {e}")
+            return {"error": f"Failed to generate chart configuration: {str(e)}"}
+    
+    def create_visualization(self, query_results: Dict[str, Any], chart_config: Dict[str, Any]) -> str:
+        """Create visualization and return base64 encoded image"""
+        try:
+            if not query_results.get("success") or not query_results.get("data"):
+                return None
+            
+            # Convert to DataFrame
+            df = pd.DataFrame(query_results["data"])
+            
+            # Create figure
+            plt.figure(figsize=(10, 6))
+            plt.style.use('seaborn-v0_8')
+            
+            chart_type = chart_config.get("chart_type", "bar")
+            title = chart_config.get("title", "Data Visualization")
+            x_col = chart_config.get("x_axis")
+            y_col = chart_config.get("y_axis")
+            
+            if chart_type == "bar":
+                self._create_bar_chart(df, x_col, y_col, title)
+            elif chart_type == "line":
+                self._create_line_chart(df, x_col, y_col, title)
+            elif chart_type == "pie":
+                self._create_pie_chart(df, x_col, y_col, title)
+            elif chart_type == "scatter":
+                self._create_scatter_chart(df, x_col, y_col, title)
+            elif chart_type == "histogram":
+                self._create_histogram(df, x_col, title)
+            else:
+                self._create_bar_chart(df, x_col, y_col, title)
+            
+            # Convert to base64
+            buffer = BytesIO()
+            plt.savefig(buffer, format='png', dpi=300, bbox_inches='tight')
+            buffer.seek(0)
+            image_base64 = base64.b64encode(buffer.getvalue()).decode()
+            plt.close()
+            
+            return image_base64
+            
+        except Exception as e:
+            logger.error(f"Error creating visualization: {e}")
+            return None
+    
+    def _create_bar_chart(self, df: pd.DataFrame, x_col: str, y_col: str, title: str):
+        if x_col and y_col and x_col in df.columns and y_col in df.columns:
+            plt.bar(df[x_col], df[y_col])
+            plt.xlabel(x_col)
+            plt.ylabel(y_col)
+        else:
+            # Auto-select columns
+            numeric_cols = df.select_dtypes(include=[np.number]).columns
+            if len(numeric_cols) > 0:
+                plt.bar(range(len(df)), df[numeric_cols[0]])
+                plt.ylabel(numeric_cols[0])
+        plt.title(title)
+        plt.xticks(rotation=45)
+    
+    def _create_line_chart(self, df: pd.DataFrame, x_col: str, y_col: str, title: str):
+        if x_col and y_col and x_col in df.columns and y_col in df.columns:
+            plt.plot(df[x_col], df[y_col], marker='o')
+            plt.xlabel(x_col)
+            plt.ylabel(y_col)
+        else:
+            numeric_cols = df.select_dtypes(include=[np.number]).columns
+            if len(numeric_cols) > 0:
+                plt.plot(df[numeric_cols[0]], marker='o')
+                plt.ylabel(numeric_cols[0])
+        plt.title(title)
+        plt.xticks(rotation=45)
+    
+    def _create_pie_chart(self, df: pd.DataFrame, x_col: str, y_col: str, title: str):
+        if x_col and y_col and x_col in df.columns and y_col in df.columns:
+            plt.pie(df[y_col], labels=df[x_col], autopct='%1.1f%%')
+        else:
+            numeric_cols = df.select_dtypes(include=[np.number]).columns
+            if len(numeric_cols) > 0:
+                plt.pie(df[numeric_cols[0]], autopct='%1.1f%%')
+        plt.title(title)
+    
+    def _create_scatter_chart(self, df: pd.DataFrame, x_col: str, y_col: str, title: str):
+        if x_col and y_col and x_col in df.columns and y_col in df.columns:
+            plt.scatter(df[x_col], df[y_col])
+            plt.xlabel(x_col)
+            plt.ylabel(y_col)
+        else:
+            numeric_cols = df.select_dtypes(include=[np.number]).columns
+            if len(numeric_cols) >= 2:
+                plt.scatter(df[numeric_cols[0]], df[numeric_cols[1]])
+                plt.xlabel(numeric_cols[0])
+                plt.ylabel(numeric_cols[1])
+        plt.title(title)
+    
+    def _create_histogram(self, df: pd.DataFrame, x_col: str, title: str):
+        if x_col and x_col in df.columns:
+            plt.hist(df[x_col], bins=20)
+            plt.xlabel(x_col)
+        else:
+            numeric_cols = df.select_dtypes(include=[np.number]).columns
+            if len(numeric_cols) > 0:
+                plt.hist(df[numeric_cols[0]], bins=20)
+                plt.xlabel(numeric_cols[0])
+        plt.title(title)
+        plt.ylabel('Frequency')
 
-# LangGraph State
-class AgentState(TypedDict):
-    messages: Annotated[List[BaseMessage], add_messages]
-    user_input: str
-    session_id: str
-    query_type: str
-    context: str
-    sql_query: str
-    query_results: Dict[str, Any]
-    final_response: str
-
-# Agent nodes
+# Main Modular SQL Agent with Enhanced Features
 class SQLAgent:
     def __init__(self):
+        # Check if required configuration is available
+        logger.info(Config.GROQ_API_KEY)
+        if not Config.GROQ_API_KEY:
+            raise ValueError("GROQ_API_KEY is not configured. Please set it in your environment variables.")
+        
         self.db_manager = DatabaseManager()
         self.schema_inspector = SchemaInspector(self.db_manager)
         self.llm = ChatGroq(
@@ -261,11 +835,19 @@ class SQLAgent:
             model_name=Config.GROQ_MODEL,
             temperature=0.1
         )
+        
+        # Initialize all sub-agents
         self.query_generator = SQLQueryGenerator(
             self.llm, 
             self.schema_inspector.get_schema_info()
         )
         self.query_executor = QueryExecutor(self.db_manager)
+        self.visualization_agent = VisualizationAgent(self.llm)
+        self.reflection_agent = ReflectionAgent(self.llm)
+        
+        # Router prompt
+        self.router_prompt = PromptTemplates.get_router_prompt()
+        self.general_prompt = PromptTemplates.get_general_response_prompt()
         
         # Build the graph
         self.graph = self._build_graph()
@@ -277,8 +859,12 @@ class SQLAgent:
         workflow.add_node("route_query", self.route_query)
         workflow.add_node("generate_sql", self.generate_sql)
         workflow.add_node("execute_sql", self.execute_sql)
-        workflow.add_node("format_response", self.format_response)
+        workflow.add_node("reflect_response", self.reflect_response)
+        workflow.add_node("refine_response", self.refine_response)
+        workflow.add_node("generate_visualization", self.generate_visualization)
+        workflow.add_node("format_sql_response", self.format_sql_response)
         workflow.add_node("handle_general", self.handle_general)
+        workflow.add_node("finalize_response", self.finalize_response)
         
         # Add edges
         workflow.set_entry_point("route_query")
@@ -287,29 +873,53 @@ class SQLAgent:
             self.route_decision,
             {
                 "sql_query": "generate_sql",
+                "visualization": "generate_sql", 
                 "general": "handle_general"
             }
         )
+        
         workflow.add_edge("generate_sql", "execute_sql")
-        workflow.add_edge("execute_sql", "format_response")
-        workflow.add_edge("handle_general", "format_response")
-        workflow.add_edge("format_response", END)
+        workflow.add_edge("execute_sql", "format_sql_response")
+        workflow.add_edge("format_sql_response", "reflect_response")
+        workflow.add_edge("reflect_response", "refine_response")
+        
+        workflow.add_conditional_edges(
+            "refine_response",
+            self.check_visualization_needed,
+            {
+                "visualization": "generate_visualization",
+                "complete": "finalize_response"
+            }
+        )
+        
+        workflow.add_edge("generate_visualization", "finalize_response")
+        workflow.add_edge("handle_general", "finalize_response")
+        workflow.add_edge("finalize_response", END)
         
         return workflow.compile()
     
     def route_query(self, state: AgentState) -> AgentState:
+        """Route the query to appropriate handler"""
         user_input = state["user_input"]
-        
-        # Simple routing logic
-        sql_keywords = ["count", "average", "sum", "total", "how many", "show me", "list", "find"]
-        
-        query_type = "sql_query" if any(keyword in user_input.lower() for keyword in sql_keywords) else "general"
         
         # Get session context
         context = ""
         if state["session_id"]:
             session_data = self.db_manager.get_session_context(state["session_id"])
             context = "\n".join([f"User: {s['user_message']}\nBot: {s['bot_response']}" for s in session_data])
+        
+        # Use LLM to route the query
+        prompt = self.router_prompt.format(
+            user_input=user_input,
+            context=context
+        )
+        
+        response = self.llm.invoke(prompt)
+        query_type = response.content.strip().lower()
+        
+        # Ensure valid query type
+        if query_type not in ["sql_query", "visualization", "general"]:
+            query_type = "general"
         
         state["query_type"] = query_type
         state["context"] = context
@@ -319,14 +929,17 @@ class SQLAgent:
         return state["query_type"]
     
     def generate_sql(self, state: AgentState) -> AgentState:
+        """Generate SQL query"""
         sql_query = self.query_generator.generate_query(
             state["user_input"], 
             state["context"]
         )
         state["sql_query"] = sql_query
+        state["generated_sql"] = sql_query
         return state
     
     def execute_sql(self, state: AgentState) -> AgentState:
+        """Execute SQL query"""
         if state["sql_query"] == "UNSUPPORTED_QUERY":
             state["query_results"] = {
                 "success": False,
@@ -337,68 +950,157 @@ class SQLAgent:
             }
         else:
             state["query_results"] = self.query_executor.execute_query(state["sql_query"])
+        
+        state["data_query_result"] = state["query_results"]
         return state
     
-    def handle_general(self, state: AgentState) -> AgentState:
-        # For general queries, provide helpful information about available data
-        response = f"""I can help you query your database. I support simple queries like:
-- Counting records: "How many users are there?"
-- Averages: "What's the average order value?"
-- Sums: "What's the total revenue?"
-- Finding records: "Show me recent orders"
-
-Available tables in your database:
-{', '.join(self.schema_inspector.get_schema_info().keys())}
-
-What would you like to know about your data?"""
+    def format_sql_response(self, state: AgentState) -> AgentState:
+        """Format the SQL response"""
+        results = state["query_results"]
+        
+        if not results["success"]:
+            response = f"Sorry, I couldn't process your query: {results['error']}"
+        else:
+            if results["row_count"] == 0:
+                response = "No data found matching your query."
+            else:
+                response = self._format_data_response(results)
         
         state["final_response"] = response
         return state
     
-    def format_response(self, state: AgentState) -> AgentState:
-        if state["query_type"] == "general":
-            return state
-        
-        results = state["query_results"]
-        
-        if not results["success"]:
-            state["final_response"] = f"Sorry, I couldn't process your query: {results['error']}"
+    def reflect_response(self, state: AgentState) -> AgentState:
+        """Reflect on the response quality"""
+        if state["query_results"]["success"]:
+            feedback = self.reflection_agent.reflect_on_response(
+                state["user_input"],
+                state["sql_query"],
+                state["query_results"],
+                state["final_response"]
+            )
+            state["reflection_feedback"] = feedback
         else:
-            if results["row_count"] == 0:
-                state["final_response"] = "No data found matching your query."
+            state["reflection_feedback"] = "APPROVED"
+        return state
+    
+    def refine_response(self, state: AgentState) -> AgentState:
+        """Refine the response based on reflection"""
+        if state["reflection_feedback"] != "APPROVED":
+            refined_response = self.reflection_agent.refine_response(
+                state["user_input"],
+                state["sql_query"],
+                state["query_results"],
+                state["final_response"],
+                state["reflection_feedback"]
+            )
+            state["refined_response"] = refined_response
+            state["final_response"] = refined_response
+        else:
+            state["refined_response"] = state["final_response"]
+        return state
+    
+    def check_visualization_needed(self, state: AgentState) -> str:
+        """Check if visualization is needed"""
+        return "visualization" if state["query_type"] == "visualization" else "complete"
+    
+    def generate_visualization(self, state: AgentState) -> AgentState:
+        """Generate visualization"""
+        if state["query_results"]["success"] and state["query_results"]["data"]:
+            # Generate chart configuration
+            chart_config = self.visualization_agent.generate_chart_config(
+                state["user_input"],
+                state["query_results"]
+            )
+            
+            if "error" not in chart_config:
+                # Create visualization
+                viz_base64 = self.visualization_agent.create_visualization(
+                    state["query_results"],
+                    chart_config
+                )
+                state["visualization_result"] = viz_base64
+                state["chart_type"] = chart_config.get("chart_type", "bar")
+                state["visualization_data"] = chart_config
             else:
-                # Format results in a readable way
-                data = results["data"]
-                columns = results["columns"]
-                
-                if len(data) == 1 and len(columns) == 1:
-                    # Single value result (like COUNT, AVG)
-                    state["final_response"] = f"Result: {data[0][columns[0]]}"
-                else:
-                    # Multiple rows/columns
-                    if data and columns:
-                        response_parts = [f"Found {results['row_count']} result(s):"]
-                        
-                        # Create a markdown table
-                        header = f"| {' | '.join(columns)} |"
-                        separator = f"| {' | '.join(['---'] * len(columns))} |"
-                        response_parts.append(header)
-                        response_parts.append(separator)
-
-                        for row in data[:10]:  # Limit to 10 rows
-                            row_str = [str(row[col]) for col in columns]
-                            response_parts.append(f"| {' | '.join(row_str)} |")
-                        
-                        if results['row_count'] > 10:
-                            response_parts.append(f"\n... and {results['row_count'] - 10} more rows.")
-
-                        state["final_response"] = "\n".join(response_parts)
-                    else:
-                        state["final_response"] = "No data found or columns are missing."
+                state["visualization_result"] = None
+                state["final_response"] += f"\n\nVisualization Error: {chart_config['error']}"
+        else:
+            state["visualization_result"] = None
         
         return state
     
+    def handle_general(self, state: AgentState) -> AgentState:
+        """Handle general queries"""
+        available_tables = list(self.schema_inspector.get_schema_info().keys())
+        
+        prompt = self.general_prompt.format(
+            user_input=state["user_input"],
+            available_tables=", ".join(available_tables),
+            context=state["context"]
+        )
+        
+        response = self.llm.invoke(prompt)
+        state["final_response"] = response.content.strip()
+        return state
+    
+    def finalize_response(self, state: AgentState) -> AgentState:
+        """Finalize the response with markdown formatting"""
+        state["markdown_result"] = self._format_markdown_response(state)
+        return state
+    
+    def _format_data_response(self, results: Dict[str, Any]) -> str:
+        """Format data results into a readable response"""
+        data = results["data"]
+        columns = results["columns"]
+        
+        if len(data) == 1 and len(columns) == 1:
+            # Single value result
+            return f"Result: {data[0][columns[0]]}"
+        else:
+            # Multiple rows/columns - create table
+            response_parts = [f"Found {results['row_count']} result(s):"]
+            
+            if data and columns:
+                # Create markdown table
+                header = f"| {' | '.join(columns)} |"
+                separator = f"| {' | '.join(['---'] * len(columns))} |"
+                response_parts.append(header)
+                response_parts.append(separator)
+
+                for row in data[:10]:  # Limit to 10 rows
+                    row_str = [str(row[col]) for col in columns]
+                    response_parts.append(f"| {' | '.join(row_str)} |")
+                
+                if results['row_count'] > 10:
+                    response_parts.append(f"\n... and {results['row_count'] - 10} more rows.")
+
+                return "\n".join(response_parts)
+            else:
+                return "No data found or columns are missing."
+    
+    def _format_markdown_response(self, state: AgentState) -> str:
+        """Format the complete response in markdown"""
+        markdown_parts = []
+        
+        # Add main response
+        markdown_parts.append(f"## Response\n{state['final_response']}")
+        
+        # Add SQL query if available
+        if state.get("generated_sql") and state["generated_sql"] != "UNSUPPORTED_QUERY":
+            markdown_parts.append(f"\n## Generated SQL\n```sql\n{state['generated_sql']}\n```")
+        
+        # Add reflection feedback if available
+        if state.get("reflection_feedback") and state["reflection_feedback"] != "APPROVED":
+            markdown_parts.append(f"\n## Analysis Notes\n{state['reflection_feedback']}")
+        
+        # Add visualization info if available
+        if state.get("visualization_result"):
+            markdown_parts.append(f"\n## Visualization\nChart Type: {state.get('chart_type', 'Unknown')}")
+        
+        return "\n".join(markdown_parts)
+    
     def process_message(self, message: str, session_id: Optional[str] = None) -> Dict[str, Any]:
+        """Process a message and return structured response"""
         if not session_id:
             session_id = str(uuid.uuid4())
         
@@ -410,7 +1112,15 @@ What would you like to know about your data?"""
             context="",
             sql_query="",
             query_results={},
-            final_response=""
+            final_response="",
+            generated_sql=None,
+            data_query_result=None,
+            markdown_result=None,
+            visualization_result=None,
+            reflection_feedback=None,
+            refined_response=None,
+            chart_type=None,
+            visualization_data=None
         )
         
         # Run the graph
@@ -424,10 +1134,15 @@ What would you like to know about your data?"""
             final_state["query_type"]
         )
         
+        # Return structured response
         return {
             "response": final_state["final_response"],
             "session_id": session_id,
-            "query_type": final_state["query_type"]
+            "query_type": final_state["query_type"],
+            "generated_sql": final_state.get("generated_sql"),
+            "data_query_result": final_state.get("data_query_result"),
+            "markdown_result": final_state.get("markdown_result"),
+            "visualization_result": final_state.get("visualization_result")
         }
 
 def show_db_config_form():
@@ -457,30 +1172,110 @@ def show_db_config_form():
                 st.error(f"Database connection failed: {e}")
 
 def show_chat_interface():
-    st.title("RAG SQL Agent Chatbot")
+    st.title("Enhanced RAG SQL Agent with Visualization")
 
     if "messages" not in st.session_state:
         st.session_state.messages = []
     if "session_id" not in st.session_state:
         st.session_state.session_id = str(uuid.uuid4())
 
+    # Display chat history
     for message in st.session_state.messages:
         with st.chat_message(message["role"]):
-            st.markdown(message["content"])
+            if message["role"] == "assistant":
+                # Display structured response
+                if "response" in message:
+                    st.markdown(message["response"])
+                
+                # Display SQL query if available
+                if message.get("generated_sql") and message["generated_sql"] != "UNSUPPORTED_QUERY":
+                    with st.expander("Generated SQL Query"):
+                        st.code(message["generated_sql"], language="sql")
+                
+                # Display data results if available
+                if message.get("data_query_result") and message["data_query_result"].get("success"):
+                    data_result = message["data_query_result"]
+                    if data_result.get("data"):
+                        with st.expander("Query Results"):
+                            # Convert to DataFrame for better display
+                            df = pd.DataFrame(data_result["data"])
+                            st.dataframe(df)
+                            st.caption(f"Total rows: {data_result['row_count']}")
+                
+                # Display visualization if available
+                if message.get("visualization_result"):
+                    with st.expander("Visualization"):
+                        # Decode base64 image
+                        import base64
+                        from io import BytesIO
+                        from PIL import Image
+                        
+                        image_data = base64.b64decode(message["visualization_result"])
+                        image = Image.open(BytesIO(image_data))
+                        st.image(image, caption="Data Visualization", use_column_width=True)
+                
+                # Display markdown formatted response
+                if message.get("markdown_result"):
+                    with st.expander("Detailed Analysis"):
+                        st.markdown(message["markdown_result"])
+            else:
+                st.markdown(message["content"])
 
-    if prompt := st.chat_input("Ask a question about your data..."):
+    # Chat input
+    if prompt := st.chat_input("Ask a question about your data or request a visualization..."):
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
 
         with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
+            with st.spinner("Processing your request..."):
                 agent = st.session_state.agent
                 result = agent.process_message(prompt, st.session_state.session_id)
-                response = result["response"]
-                st.markdown(response)
+                
+                # Display main response
+                st.markdown(result["response"])
+                
+                # Display SQL query if available
+                if result.get("generated_sql") and result["generated_sql"] != "UNSUPPORTED_QUERY":
+                    with st.expander("Generated SQL Query"):
+                        st.code(result["generated_sql"], language="sql")
+                
+                # Display data results if available
+                if result.get("data_query_result") and result["data_query_result"].get("success"):
+                    data_result = result["data_query_result"]
+                    if data_result.get("data"):
+                        with st.expander("Query Results"):
+                            # Convert to DataFrame for better display
+                            df = pd.DataFrame(data_result["data"])
+                            st.dataframe(df)
+                            st.caption(f"Total rows: {data_result['row_count']}")
+                
+                # Display visualization if available
+                if result.get("visualization_result"):
+                    with st.expander("Visualization"):
+                        # Decode base64 image
+                        import base64
+                        from io import BytesIO
+                        from PIL import Image
+                        
+                        image_data = base64.b64decode(result["visualization_result"])
+                        image = Image.open(BytesIO(image_data))
+                        st.image(image, caption="Data Visualization", use_column_width=True)
+                
+                # Display markdown formatted response
+                if result.get("markdown_result"):
+                    with st.expander("Detailed Analysis"):
+                        st.markdown(result["markdown_result"])
         
-        st.session_state.messages.append({"role": "assistant", "content": response})
+        # Save the complete result to session
+        st.session_state.messages.append({
+            "role": "assistant",
+            "response": result["response"],
+            "generated_sql": result.get("generated_sql"),
+            "data_query_result": result.get("data_query_result"),
+            "markdown_result": result.get("markdown_result"),
+            "visualization_result": result.get("visualization_result")
+        })
 
 def main():
     st.set_page_config(page_title="Bisee Chatbot", layout="wide")
