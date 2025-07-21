@@ -340,10 +340,11 @@ class AgentState(TypedDict):
     messages: Annotated[List[BaseMessage], add_messages]
     user_input: str
     session_id: str
-    query_type: str
+    query_types: List[str]  # Changed from query_type to query_types array
     context: str
     sql_query: str
     query_results: Dict[str, Any]
+    query_data: List[Dict[str, Any]]  # New variable for only query result data
     final_response: str
     # New fields for enhanced response
     generated_sql: Optional[str]
@@ -559,26 +560,6 @@ If the user is greeting you, respond appropriately and explain your capabilities
 """
         )
 
-# Enhanced LangGraph State
-class AgentState(TypedDict):
-    messages: Annotated[List[BaseMessage], add_messages]
-    user_input: str
-    session_id: str
-    query_type: str
-    context: str
-    sql_query: str
-    query_results: Dict[str, Any]
-    final_response: str
-    # New fields for enhanced response
-    generated_sql: Optional[str]
-    data_query_result: Optional[Dict[str, Any]]
-    markdown_result: Optional[str]
-    visualization_result: Optional[str]
-    reflection_feedback: Optional[str]
-    refined_response: Optional[str]
-    chart_type: Optional[str]
-    visualization_data: Optional[Dict[str, Any]]
-
 # SQL Query Generator
 class SQLQueryGenerator:
     def __init__(self, llm: ChatGroq, schema_info: Dict[str, Any]):
@@ -700,6 +681,17 @@ class VisualizationAgent:
         
         data = query_results["data"]
         columns = query_results["columns"]
+        logger.info(data, "Query results data")
+        logger.info(columns, "Query results columns")
+        
+        # Create a fallback configuration first
+        fallback_config = {
+            "chart_type": "bar",
+            "title": "Data Visualization",
+            "x_axis": columns[0] if columns else None,
+            "y_axis": columns[1] if len(columns) > 1 else columns[0] if columns else None,
+            "description": "Auto-generated chart from query results"
+        }
         
         prompt = self.viz_prompt.format(
             user_input=user_input,
@@ -709,11 +701,50 @@ class VisualizationAgent:
         
         try:
             response = self.llm.invoke(prompt)
-            config = json.loads(response.content.strip())
+            response_content = response.content.strip()
+            
+            # Check if response is empty
+            if not response_content:
+                logger.warning("Empty response from LLM for chart config, using fallback")
+                return fallback_config
+            
+            # Try to extract JSON from response if it's wrapped in markdown
+            if "```json" in response_content:
+                # Extract JSON from markdown code block
+                import re
+                json_match = re.search(r'```json\s*(.*?)\s*```', response_content, re.DOTALL)
+                if json_match:
+                    response_content = json_match.group(1).strip()
+            elif "```" in response_content:
+                # Extract content from any code block
+                import re
+                json_match = re.search(r'```\s*(.*?)\s*```', response_content, re.DOTALL)
+                if json_match:
+                    response_content = json_match.group(1).strip()
+            
+            # Parse JSON
+            config = json.loads(response_content)
+            
+            # Validate required fields and add defaults if missing
+            if not isinstance(config, dict):
+                logger.warning("Invalid config format from LLM, using fallback")
+                return fallback_config
+            
+            # Ensure required fields exist
+            config.setdefault("chart_type", fallback_config["chart_type"])
+            config.setdefault("title", fallback_config["title"])
+            config.setdefault("x_axis", fallback_config["x_axis"])
+            config.setdefault("y_axis", fallback_config["y_axis"])
+            config.setdefault("description", fallback_config["description"])
+            
             return config
+            
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON decode error in chart config: {e}. Response was: {response_content[:200]}...")
+            return fallback_config
         except Exception as e:
             logger.error(f"Error generating chart config: {e}")
-            return {"error": f"Failed to generate chart configuration: {str(e)}"}
+            return fallback_config
     
     def create_visualization(self, query_results: Dict[str, Any], chart_config: Dict[str, Any]) -> str:
         """Create visualization and return base64 encoded image"""
@@ -724,14 +755,32 @@ class VisualizationAgent:
             # Convert to DataFrame
             df = pd.DataFrame(query_results["data"])
             
+            # Enhanced logic for axis determination based on your requirements
+            # If data has 2+ rows and 2+ columns, use column 1 as labels for axis and the rest as data
+            x_col = None
+            y_col = None
+            
+            if len(df) >= 2 and len(df.columns) >= 2:
+                # Column 1 (index 0) is label for the axis
+                x_col = df.columns[0]
+                # Column 2 (index 1) is the data for y-axis
+                y_col = df.columns[1] if len(df.columns) > 1 else None
+            
+            # Override with chart config if provided
+            chart_x_col = chart_config.get("x_axis")
+            chart_y_col = chart_config.get("y_axis")
+            
+            if chart_x_col and chart_x_col in df.columns:
+                x_col = chart_x_col
+            if chart_y_col and chart_y_col in df.columns:
+                y_col = chart_y_col
+            
             # Create figure
             plt.figure(figsize=(10, 6))
             plt.style.use('seaborn-v0_8')
             
             chart_type = chart_config.get("chart_type", "bar")
             title = chart_config.get("title", "Data Visualization")
-            x_col = chart_config.get("x_axis")
-            y_col = chart_config.get("y_axis")
             
             if chart_type == "bar":
                 self._create_bar_chart(df, x_col, y_col, title)
@@ -908,25 +957,79 @@ class SQLAgent:
             session_data = self.db_manager.get_session_context(state["session_id"])
             context = "\n".join([f"User: {s['user_message']}\nBot: {s['bot_response']}" for s in session_data])
         
-        # Use LLM to route the query
-        prompt = self.router_prompt.format(
-            user_input=user_input,
-            context=context
-        )
+        # Enhanced routing logic to detect multiple query types
+        query_types = []
+        user_input_lower = user_input.lower()
         
-        response = self.llm.invoke(prompt)
-        query_type = response.content.strip().lower()
+        # Check for visualization keywords
+        viz_keywords = ["chart", "graph", "plot", "visualize", "visualization", "show chart", "bar chart", "pie chart"]
+        has_viz_keyword = any(keyword in user_input_lower for keyword in viz_keywords)
         
-        # Ensure valid query type
-        if query_type not in ["sql_query", "visualization", "general"]:
-            query_type = "general"
+        # Check for SQL/data keywords
+        sql_keywords = ["count", "how many", "show", "list", "average", "sum", "total", "find", "data", "select", "table"]
+        has_sql_keyword = any(keyword in user_input_lower for keyword in sql_keywords)
         
-        state["query_type"] = query_type
+        # Check for general keywords
+        general_keywords = ["hello", "hi", "help", "what can you", "greeting"]
+        has_general_keyword = any(keyword in user_input_lower for keyword in general_keywords)
+        
+        # Determine query types based on keywords
+        if has_general_keyword and not (has_viz_keyword or has_sql_keyword):
+            query_types = ["general"]
+        elif has_viz_keyword and (has_sql_keyword or any(word in user_input_lower for word in ["data", "show", "display"])):
+            query_types = ["sql_query", "visualization"]
+        elif has_viz_keyword:
+            query_types = ["sql_query", "visualization"]  # Visualization typically needs data first
+        elif has_sql_keyword:
+            query_types = ["sql_query"]
+        else:
+            query_types = ["general"]
+        
+        # Fallback to LLM if uncertain
+        if len(query_types) == 0 or (len(query_types) == 1 and query_types[0] == "general" and (has_sql_keyword or has_viz_keyword)):
+            try:
+                # Use LLM to route the query as fallback
+                prompt = self.router_prompt.format(
+                    user_input=user_input,
+                    context=context
+                )
+                
+                response = self.llm.invoke(prompt)
+                response_content = response.content.strip()
+                
+                # Try to parse JSON response
+                import json
+                try:
+                    parsed_types = json.loads(response_content)
+                    if isinstance(parsed_types, list):
+                        query_types = parsed_types
+                    else:
+                        query_types = [parsed_types] if parsed_types in ["sql_query", "visualization", "general"] else ["general"]
+                except:
+                    # Fallback to single type parsing
+                    query_type = response_content.lower()
+                    if query_type in ["sql_query", "visualization", "general"]:
+                        query_types = [query_type]
+                    else:
+                        query_types = ["general"]
+            except:
+                query_types = ["general"]
+        
+        state["query_types"] = query_types
         state["context"] = context
         return state
     
     def route_decision(self, state: AgentState) -> str:
-        return state["query_type"]
+        """Decide the route based on query types"""
+        query_types = state["query_types"]
+        
+        # Priority routing logic
+        if "general" in query_types and len(query_types) == 1:
+            return "general"
+        elif "sql_query" in query_types:
+            return "sql_query"  # Start with SQL generation if data is needed
+        else:
+            return "general"
     
     def generate_sql(self, state: AgentState) -> AgentState:
         """Generate SQL query"""
@@ -948,8 +1051,12 @@ class SQLAgent:
                 "columns": [],
                 "row_count": 0
             }
+            state["query_data"] = []
         else:
-            state["query_results"] = self.query_executor.execute_query(state["sql_query"])
+            query_results = self.query_executor.execute_query(state["sql_query"])
+            state["query_results"] = query_results
+            # Extract only the data for the new query_data variable
+            state["query_data"] = query_results.get("data", []) if query_results.get("success") else []
         
         state["data_query_result"] = state["query_results"]
         return state
@@ -1001,7 +1108,8 @@ class SQLAgent:
     
     def check_visualization_needed(self, state: AgentState) -> str:
         """Check if visualization is needed"""
-        return "visualization" if state["query_type"] == "visualization" else "complete"
+        query_types = state["query_types"]
+        return "visualization" if "visualization" in query_types else "complete"
     
     def generate_visualization(self, state: AgentState) -> AgentState:
         """Generate visualization"""
@@ -1108,10 +1216,11 @@ class SQLAgent:
             messages=[HumanMessage(content=message)],
             user_input=message,
             session_id=session_id,
-            query_type="",
+            query_types=[],  # Changed from query_type to query_types
             context="",
             sql_query="",
             query_results={},
+            query_data=[],  # New field for only query result data
             final_response="",
             generated_sql=None,
             data_query_result=None,
@@ -1127,18 +1236,20 @@ class SQLAgent:
         final_state = self.graph.invoke(initial_state)
         
         # Save to session
+        query_type_str = ", ".join(final_state["query_types"]) if final_state["query_types"] else "general"
         self.db_manager.save_session(
             session_id,
             message,
             final_state["final_response"],
-            final_state["query_type"]
+            query_type_str
         )
         
         # Return structured response
         return {
             "response": final_state["final_response"],
             "session_id": session_id,
-            "query_type": final_state["query_type"],
+            "query_types": final_state["query_types"],  # Return as array
+            "query_type": query_type_str,  # Keep for backward compatibility
             "generated_sql": final_state.get("generated_sql"),
             "data_query_result": final_state.get("data_query_result"),
             "markdown_result": final_state.get("markdown_result"),
