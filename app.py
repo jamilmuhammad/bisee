@@ -617,8 +617,8 @@ class SQLQueryGenerator:
 
         # Must start with SELECT
         if not query_upper.startswith("SELECT"):
-            return False
-        
+            return "UNSUPPORTED_QUERY"
+
         # Blocked keywords
         blocked_keywords = [
             'INSERT', 'UPDATE', 'DELETE', 'DROP', 'ALTER', 'CREATE',
@@ -628,8 +628,8 @@ class SQLQueryGenerator:
         
         for keyword in blocked_keywords:
             if keyword in query_upper:
-                return False
-        
+                return "UNSUPPORTED_QUERY"
+
         return True
 
 # Reflection Agent
