@@ -31,6 +31,28 @@ import seaborn as sns
 import pandas as pd
 import numpy as np
 
+# Predictive analysis imports
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.preprocessing import StandardScaler
+import warnings
+warnings.filterwarnings('ignore')
+
+# Time series forecasting imports
+try:
+    from statsmodels.tsa.arima.model import ARIMA
+    from statsmodels.tsa.seasonal import seasonal_decompose
+    from statsmodels.tsa.holtwinters import ExponentialSmoothing
+    STATSMODELS_AVAILABLE = True
+except ImportError:
+    STATSMODELS_AVAILABLE = False
+
+try:
+    from prophet import Prophet
+    PROPHET_AVAILABLE = True
+except ImportError:
+    PROPHET_AVAILABLE = False
+
 # Configure logging
 logging.basicConfig(
     level=logging.INFO,
@@ -355,6 +377,12 @@ class AgentState(TypedDict):
     refined_response: Optional[str]
     chart_type: Optional[str]
     visualization_data: Optional[Dict[str, Any]]
+    # New fields for predictive and prescriptive analysis
+    analysis_type: Optional[str]  # descriptive, predictive, prescriptive
+    forecast_results: Optional[Dict[str, Any]]
+    simulation_results: Optional[Dict[str, Any]]
+    predictive_model: Optional[str]  # ARIMA, Prophet, Linear, etc.
+    simulation_parameters: Optional[Dict[str, Any]]
 
 # Database Schema Inspector
 class SchemaInspector:
@@ -557,6 +585,76 @@ Provide a helpful response that:
 4. Maintains a friendly, professional tone
 
 If the user is greeting you, respond appropriately and explain your capabilities.
+"""
+        )
+
+    @staticmethod
+    def get_predictive_analysis_prompt():
+        return PromptTemplate(
+            input_variables=["user_input", "query_data", "columns", "analysis_context"],
+            template="""
+You are a predictive analytics expert that analyzes historical data to make forecasts.
+
+User Request: {user_input}
+Historical Data: {query_data}
+Available Columns: {columns}
+Context: {analysis_context}
+
+Based on the historical data provided, determine the best forecasting approach:
+
+1. Identify time-based patterns (trends, seasonality)
+2. Recommend appropriate forecasting model (ARIMA, Prophet, Linear Regression, etc.)
+3. Suggest forecast horizon (periods to predict ahead)
+4. Identify key variables for prediction
+
+Return a JSON object with:
+{{
+    "model_type": "arima|prophet|linear|exponential_smoothing",
+    "forecast_periods": "number of periods to forecast",
+    "time_column": "column name containing dates/time",
+    "target_column": "column name to forecast",
+    "seasonality": "detected seasonality pattern if any",
+    "trend": "detected trend pattern",
+    "confidence_level": "0.95",
+    "description": "Brief explanation of the forecasting approach"
+}}
+"""
+        )
+
+    @staticmethod
+    def get_prescriptive_analysis_prompt():
+        return PromptTemplate(
+            input_variables=["user_input", "query_data", "columns", "descriptive_context"],
+            template="""
+You are a prescriptive analytics expert that performs what-if analysis and simulations.
+
+User Request: {user_input}
+Current Data: {query_data}
+Available Columns: {columns}
+Descriptive Context: {descriptive_context}
+
+Based on the current data and user request, design a simulation or what-if analysis:
+
+1. Identify variables to modify (independent variables)
+2. Determine the target outcome (dependent variable)
+3. Suggest simulation parameters and ranges
+4. Recommend simulation scenarios
+
+Return a JSON object with:
+{{
+    "simulation_type": "what_if|sensitivity|scenario|optimization",
+    "independent_variables": ["list of columns to vary"],
+    "dependent_variable": "target outcome column",
+    "scenarios": [
+        {{
+            "name": "scenario name",
+            "parameters": {{"column": "new_value"}},
+            "description": "what this scenario tests"
+        }}
+    ],
+    "parameter_ranges": {{"column": {{"min": value, "max": value, "step": value}}}},
+    "description": "Brief explanation of the simulation approach"
+}}
 """
         )
 
@@ -869,6 +967,394 @@ class VisualizationAgent:
         plt.title(title)
         plt.ylabel('Frequency')
 
+# Predictive Analysis Agent
+class PredictiveAnalysisAgent:
+    def __init__(self, llm: ChatGroq):
+        self.llm = llm
+        self.predictive_prompt = PromptTemplates.get_predictive_analysis_prompt()
+    
+    def generate_forecast_config(self, user_input: str, query_data: List[Dict], columns: List[str], context: str = "") -> Dict[str, Any]:
+        """Generate forecasting configuration based on historical data"""
+        if not query_data or not columns:
+            return {"error": "No data available for predictive analysis"}
+        
+        # Fallback configuration
+        fallback_config = {
+            "model_type": "linear",
+            "forecast_periods": 12,
+            "time_column": None,
+            "target_column": columns[0] if columns else None,
+            "confidence_level": 0.95,
+            "description": "Simple linear forecast based on available data"
+        }
+        
+        try:
+            prompt = self.predictive_prompt.format(
+                user_input=user_input,
+                query_data=str(query_data[:10]),  # First 10 rows for analysis
+                columns=str(columns),
+                analysis_context=context
+            )
+            
+            response = self.llm.invoke(prompt)
+            response_content = response.content.strip()
+            
+            # Parse JSON response with fallback
+            if "```json" in response_content:
+                import re
+                json_match = re.search(r'```json\s*(.*?)\s*```', response_content, re.DOTALL)
+                if json_match:
+                    response_content = json_match.group(1).strip()
+            
+            config = json.loads(response_content)
+            
+            # Validate and set defaults
+            config.setdefault("model_type", fallback_config["model_type"])
+            config.setdefault("forecast_periods", fallback_config["forecast_periods"])
+            config.setdefault("confidence_level", fallback_config["confidence_level"])
+            
+            return config
+            
+        except Exception as e:
+            logger.error(f"Error generating forecast config: {e}")
+            return fallback_config
+    
+    def create_forecast(self, query_data: List[Dict], forecast_config: Dict[str, Any]) -> Dict[str, Any]:
+        """Create forecast based on configuration"""
+        try:
+            if not query_data:
+                return {"error": "No data for forecasting"}
+            
+            df = pd.DataFrame(query_data)
+            model_type = forecast_config.get("model_type", "linear")
+            target_col = forecast_config.get("target_column")
+            time_col = forecast_config.get("time_column")
+            periods = int(forecast_config.get("forecast_periods", 12))
+            
+            if target_col not in df.columns:
+                # Use first numeric column
+                numeric_cols = df.select_dtypes(include=[np.number]).columns
+                target_col = numeric_cols[0] if len(numeric_cols) > 0 else df.columns[0]
+            
+            if model_type == "arima" and STATSMODELS_AVAILABLE:
+                return self._create_arima_forecast(df, target_col, periods)
+            elif model_type == "prophet" and PROPHET_AVAILABLE:
+                return self._create_prophet_forecast(df, target_col, time_col, periods)
+            elif model_type == "exponential_smoothing" and STATSMODELS_AVAILABLE:
+                return self._create_exponential_smoothing_forecast(df, target_col, periods)
+            else:
+                return self._create_linear_forecast(df, target_col, periods)
+                
+        except Exception as e:
+            logger.error(f"Error creating forecast: {e}")
+            return {"error": f"Forecasting failed: {str(e)}"}
+    
+    def _create_linear_forecast(self, df: pd.DataFrame, target_col: str, periods: int) -> Dict[str, Any]:
+        """Create linear regression forecast"""
+        try:
+            values = df[target_col].values
+            X = np.arange(len(values)).reshape(-1, 1)
+            y = values
+            
+            model = LinearRegression()
+            model.fit(X, y)
+            
+            # Generate forecasts
+            future_X = np.arange(len(values), len(values) + periods).reshape(-1, 1)
+            forecasts = model.predict(future_X)
+            
+            # Calculate basic confidence intervals (simplified)
+            residuals = y - model.predict(X)
+            mse = np.mean(residuals**2)
+            std_error = np.sqrt(mse)
+            confidence_interval = 1.96 * std_error  # 95% CI
+            
+            return {
+                "model": "Linear Regression",
+                "forecasts": forecasts.tolist(),
+                "confidence_lower": (forecasts - confidence_interval).tolist(),
+                "confidence_upper": (forecasts + confidence_interval).tolist(),
+                "historical_values": values.tolist(),
+                "mae": mean_absolute_error(y, model.predict(X)),
+                "mse": mse,
+                "periods": periods
+            }
+        except Exception as e:
+            return {"error": f"Linear forecast failed: {str(e)}"}
+    
+    def _create_arima_forecast(self, df: pd.DataFrame, target_col: str, periods: int) -> Dict[str, Any]:
+        """Create ARIMA forecast"""
+        try:
+            from statsmodels.tsa.arima.model import ARIMA
+            values = df[target_col].values
+            
+            # Fit ARIMA model (auto-detect parameters)
+            model = ARIMA(values, order=(1, 1, 1))
+            fitted_model = model.fit()
+            
+            # Generate forecasts
+            forecast_result = fitted_model.forecast(steps=periods, alpha=0.05)
+            forecasts = forecast_result
+            
+            return {
+                "model": "ARIMA(1,1,1)",
+                "forecasts": forecasts.tolist(),
+                "historical_values": values.tolist(),
+                "periods": periods,
+                "aic": fitted_model.aic,
+                "bic": fitted_model.bic
+            }
+        except Exception as e:
+            return {"error": f"ARIMA forecast failed: {str(e)}"}
+    
+    def _create_prophet_forecast(self, df: pd.DataFrame, target_col: str, time_col: str, periods: int) -> Dict[str, Any]:
+        """Create Prophet forecast"""
+        try:
+            from prophet import Prophet
+            
+            # Prepare data for Prophet
+            prophet_df = pd.DataFrame()
+            if time_col and time_col in df.columns:
+                prophet_df['ds'] = pd.to_datetime(df[time_col])
+            else:
+                # Create synthetic time index
+                prophet_df['ds'] = pd.date_range(start='2020-01-01', periods=len(df), freq='D')
+            
+            prophet_df['y'] = df[target_col].values
+            
+            # Fit Prophet model
+            model = Prophet()
+            model.fit(prophet_df)
+            
+            # Generate future dates
+            future = model.make_future_dataframe(periods=periods)
+            forecast = model.predict(future)
+            
+            return {
+                "model": "Prophet",
+                "forecasts": forecast['yhat'].tail(periods).tolist(),
+                "confidence_lower": forecast['yhat_lower'].tail(periods).tolist(),
+                "confidence_upper": forecast['yhat_upper'].tail(periods).tolist(),
+                "historical_values": df[target_col].tolist(),
+                "periods": periods,
+                "trend": forecast['trend'].tail(periods).tolist()
+            }
+        except Exception as e:
+            return {"error": f"Prophet forecast failed: {str(e)}"}
+    
+    def _create_exponential_smoothing_forecast(self, df: pd.DataFrame, target_col: str, periods: int) -> Dict[str, Any]:
+        """Create Exponential Smoothing forecast"""
+        try:
+            from statsmodels.tsa.holtwinters import ExponentialSmoothing
+            values = df[target_col].values
+            
+            # Fit Exponential Smoothing model
+            model = ExponentialSmoothing(values, trend='add', seasonal=None)
+            fitted_model = model.fit()
+            
+            # Generate forecasts
+            forecasts = fitted_model.forecast(periods)
+            
+            return {
+                "model": "Exponential Smoothing",
+                "forecasts": forecasts.tolist(),
+                "historical_values": values.tolist(),
+                "periods": periods
+            }
+        except Exception as e:
+            return {"error": f"Exponential Smoothing forecast failed: {str(e)}"}
+
+# Prescriptive Analysis Agent
+class PrescriptiveAnalysisAgent:
+    def __init__(self, llm: ChatGroq):
+        self.llm = llm
+        self.prescriptive_prompt = PromptTemplates.get_prescriptive_analysis_prompt()
+    
+    def generate_simulation_config(self, user_input: str, query_data: List[Dict], columns: List[str], context: str = "") -> Dict[str, Any]:
+        """Generate simulation configuration based on current data"""
+        if not query_data or not columns:
+            return {"error": "No data available for prescriptive analysis"}
+        
+        # Fallback configuration
+        fallback_config = {
+            "simulation_type": "what_if",
+            "independent_variables": [columns[0]] if columns else [],
+            "dependent_variable": columns[1] if len(columns) > 1 else columns[0] if columns else None,
+            "scenarios": [
+                {
+                    "name": "Baseline",
+                    "parameters": {},
+                    "description": "Current state without changes"
+                }
+            ],
+            "description": "Basic what-if simulation based on available data"
+        }
+        
+        try:
+            prompt = self.prescriptive_prompt.format(
+                user_input=user_input,
+                query_data=str(query_data[:10]),  # First 10 rows for analysis
+                columns=str(columns),
+                descriptive_context=context
+            )
+            
+            response = self.llm.invoke(prompt)
+            response_content = response.content.strip()
+            
+            # Parse JSON response with fallback
+            if "```json" in response_content:
+                import re
+                json_match = re.search(r'```json\s*(.*?)\s*```', response_content, re.DOTALL)
+                if json_match:
+                    response_content = json_match.group(1).strip()
+            
+            config = json.loads(response_content)
+            
+            # Validate and set defaults
+            config.setdefault("simulation_type", fallback_config["simulation_type"])
+            config.setdefault("independent_variables", fallback_config["independent_variables"])
+            config.setdefault("dependent_variable", fallback_config["dependent_variable"])
+            config.setdefault("scenarios", fallback_config["scenarios"])
+            
+            return config
+            
+        except Exception as e:
+            logger.error(f"Error generating simulation config: {e}")
+            return fallback_config
+    
+    def run_simulation(self, query_data: List[Dict], simulation_config: Dict[str, Any]) -> Dict[str, Any]:
+        """Run simulation based on configuration"""
+        try:
+            if not query_data:
+                return {"error": "No data for simulation"}
+            
+            df = pd.DataFrame(query_data)
+            simulation_type = simulation_config.get("simulation_type", "what_if")
+            independent_vars = simulation_config.get("independent_variables", [])
+            dependent_var = simulation_config.get("dependent_variable")
+            scenarios = simulation_config.get("scenarios", [])
+            
+            if simulation_type == "what_if":
+                return self._run_what_if_simulation(df, independent_vars, dependent_var, scenarios)
+            elif simulation_type == "sensitivity":
+                return self._run_sensitivity_analysis(df, independent_vars, dependent_var)
+            elif simulation_type == "scenario":
+                return self._run_scenario_analysis(df, independent_vars, dependent_var, scenarios)
+            else:
+                return self._run_what_if_simulation(df, independent_vars, dependent_var, scenarios)
+                
+        except Exception as e:
+            logger.error(f"Error running simulation: {e}")
+            return {"error": f"Simulation failed: {str(e)}"}
+    
+    def _run_what_if_simulation(self, df: pd.DataFrame, independent_vars: List[str], dependent_var: str, scenarios: List[Dict]) -> Dict[str, Any]:
+        """Run what-if simulation"""
+        try:
+            results = {
+                "simulation_type": "What-If Analysis",
+                "scenarios": [],
+                "baseline": {}
+            }
+            
+            # Calculate baseline
+            if dependent_var and dependent_var in df.columns:
+                baseline_value = df[dependent_var].mean()
+                results["baseline"] = {
+                    "scenario": "Current State",
+                    "value": baseline_value,
+                    "description": f"Current average {dependent_var}"
+                }
+            
+            # Run scenarios
+            for scenario in scenarios:
+                scenario_name = scenario.get("name", "Scenario")
+                parameters = scenario.get("parameters", {})
+                
+                # Create modified dataset
+                modified_df = df.copy()
+                for param, value in parameters.items():
+                    if param in modified_df.columns:
+                        # Apply percentage change if value is string with %
+                        if isinstance(value, str) and '%' in value:
+                            percent_change = float(value.replace('%', '')) / 100
+                            modified_df[param] = modified_df[param] * (1 + percent_change)
+                        else:
+                            try:
+                                modified_df[param] = float(value)
+                            except:
+                                pass  # Skip if cannot convert
+                
+                # Calculate impact on dependent variable
+                if dependent_var and dependent_var in modified_df.columns:
+                    new_value = modified_df[dependent_var].mean()
+                    change = new_value - baseline_value
+                    change_percent = (change / baseline_value * 100) if baseline_value != 0 else 0
+                    
+                    results["scenarios"].append({
+                        "name": scenario_name,
+                        "parameters": parameters,
+                        "result": new_value,
+                        "change": change,
+                        "change_percent": change_percent,
+                        "description": scenario.get("description", "")
+                    })
+            
+            return results
+            
+        except Exception as e:
+            return {"error": f"What-if simulation failed: {str(e)}"}
+    
+    def _run_sensitivity_analysis(self, df: pd.DataFrame, independent_vars: List[str], dependent_var: str) -> Dict[str, Any]:
+        """Run sensitivity analysis"""
+        try:
+            results = {
+                "simulation_type": "Sensitivity Analysis",
+                "variables": [],
+                "correlations": {}
+            }
+            
+            if dependent_var and dependent_var in df.columns:
+                for var in independent_vars:
+                    if var in df.columns:
+                        # Calculate correlation
+                        correlation = df[var].corr(df[dependent_var])
+                        
+                        # Test different values (+-10%, +-20%)
+                        test_values = [-20, -10, 10, 20]  # percentage changes
+                        sensitivity_results = []
+                        
+                        baseline = df[dependent_var].mean()
+                        
+                        for change_percent in test_values:
+                            modified_df = df.copy()
+                            modified_df[var] = modified_df[var] * (1 + change_percent/100)
+                            new_dependent = modified_df[dependent_var].mean()
+                            impact = new_dependent - baseline
+                            
+                            sensitivity_results.append({
+                                "change_percent": change_percent,
+                                "impact": impact,
+                                "new_value": new_dependent
+                            })
+                        
+                        results["variables"].append({
+                            "variable": var,
+                            "correlation": correlation,
+                            "sensitivity": sensitivity_results
+                        })
+                        
+                        results["correlations"][var] = correlation
+            
+            return results
+            
+        except Exception as e:
+            return {"error": f"Sensitivity analysis failed: {str(e)}"}
+    
+    def _run_scenario_analysis(self, df: pd.DataFrame, independent_vars: List[str], dependent_var: str, scenarios: List[Dict]) -> Dict[str, Any]:
+        """Run comprehensive scenario analysis"""
+        # For now, use what-if simulation logic
+        return self._run_what_if_simulation(df, independent_vars, dependent_var, scenarios)
+
 # Main Modular SQL Agent with Enhanced Features
 class SQLAgent:
     def __init__(self):
@@ -893,6 +1379,8 @@ class SQLAgent:
         self.query_executor = QueryExecutor(self.db_manager)
         self.visualization_agent = VisualizationAgent(self.llm)
         self.reflection_agent = ReflectionAgent(self.llm)
+        self.predictive_agent = PredictiveAnalysisAgent(self.llm)
+        self.prescriptive_agent = PrescriptiveAnalysisAgent(self.llm)
         
         # Router prompt
         self.router_prompt = PromptTemplates.get_router_prompt()
@@ -911,6 +1399,8 @@ class SQLAgent:
         workflow.add_node("reflect_response", self.reflect_response)
         workflow.add_node("refine_response", self.refine_response)
         workflow.add_node("generate_visualization", self.generate_visualization)
+        workflow.add_node("generate_predictive", self.generate_predictive)
+        workflow.add_node("generate_prescriptive", self.generate_prescriptive)
         workflow.add_node("format_sql_response", self.format_sql_response)
         workflow.add_node("handle_general", self.handle_general)
         workflow.add_node("finalize_response", self.finalize_response)
@@ -923,6 +1413,8 @@ class SQLAgent:
             {
                 "sql_query": "generate_sql",
                 "visualization": "generate_sql", 
+                "predictive": "generate_sql",
+                "prescriptive": "generate_sql",
                 "general": "handle_general"
             }
         )
@@ -934,14 +1426,18 @@ class SQLAgent:
         
         workflow.add_conditional_edges(
             "refine_response",
-            self.check_visualization_needed,
+            self.check_analysis_needed,
             {
                 "visualization": "generate_visualization",
+                "predictive": "generate_predictive",
+                "prescriptive": "generate_prescriptive",
                 "complete": "finalize_response"
             }
         )
         
         workflow.add_edge("generate_visualization", "finalize_response")
+        workflow.add_edge("generate_predictive", "finalize_response")
+        workflow.add_edge("generate_prescriptive", "finalize_response")
         workflow.add_edge("handle_general", "finalize_response")
         workflow.add_edge("finalize_response", END)
         
@@ -969,13 +1465,29 @@ class SQLAgent:
         sql_keywords = ["count", "how many", "show", "list", "average", "sum", "total", "find", "data", "select", "table"]
         has_sql_keyword = any(keyword in user_input_lower for keyword in sql_keywords)
         
+        # Check for predictive analysis keywords
+        predictive_keywords = ["forecast", "predict", "prediction", "future", "trend", "project", "estimate", "anticipate", "expect", "model", "arima", "prophet"]
+        has_predictive_keyword = any(keyword in user_input_lower for keyword in predictive_keywords)
+        
+        # Check for prescriptive analysis keywords
+        prescriptive_keywords = ["simulate", "simulation", "what if", "scenario", "optimize", "recommend", "suggest", "best", "improve", "change", "modify", "test"]
+        has_prescriptive_keyword = any(keyword in user_input_lower for keyword in prescriptive_keywords)
+        
         # Check for general keywords
         general_keywords = ["hello", "hi", "help", "what can you", "greeting"]
         has_general_keyword = any(keyword in user_input_lower for keyword in general_keywords)
         
         # Determine query types based on keywords
-        if has_general_keyword and not (has_viz_keyword or has_sql_keyword):
+        if has_general_keyword and not (has_viz_keyword or has_sql_keyword or has_predictive_keyword or has_prescriptive_keyword):
             query_types = ["general"]
+        elif has_predictive_keyword:
+            query_types = ["sql_query", "predictive"]
+            if has_viz_keyword:
+                query_types.append("visualization")
+        elif has_prescriptive_keyword:
+            query_types = ["sql_query", "prescriptive"]
+            if has_viz_keyword:
+                query_types.append("visualization")
         elif has_viz_keyword and (has_sql_keyword or any(word in user_input_lower for word in ["data", "show", "display"])):
             query_types = ["sql_query", "visualization"]
         elif has_viz_keyword:
@@ -1026,6 +1538,10 @@ class SQLAgent:
         # Priority routing logic
         if "general" in query_types and len(query_types) == 1:
             return "general"
+        elif "predictive" in query_types:
+            return "predictive"  # Predictive analysis needs data first
+        elif "prescriptive" in query_types:
+            return "prescriptive"  # Prescriptive analysis needs data first
         elif "sql_query" in query_types:
             return "sql_query"  # Start with SQL generation if data is needed
         else:
@@ -1106,10 +1622,19 @@ class SQLAgent:
             state["refined_response"] = state["final_response"]
         return state
     
-    def check_visualization_needed(self, state: AgentState) -> str:
-        """Check if visualization is needed"""
+    def check_analysis_needed(self, state: AgentState) -> str:
+        """Check what type of analysis is needed"""
         query_types = state["query_types"]
-        return "visualization" if "visualization" in query_types else "complete"
+        
+        # Priority order: predictive > prescriptive > visualization > complete
+        if "predictive" in query_types:
+            return "predictive"
+        elif "prescriptive" in query_types:
+            return "prescriptive"
+        elif "visualization" in query_types:
+            return "visualization"
+        else:
+            return "complete"
     
     def generate_visualization(self, state: AgentState) -> AgentState:
         """Generate visualization"""
@@ -1137,6 +1662,115 @@ class SQLAgent:
         
         return state
     
+    def generate_predictive(self, state: AgentState) -> AgentState:
+        """Generate predictive analysis"""
+        if state["query_results"]["success"] and state["query_results"]["data"]:
+            # Determine analysis type
+            state["analysis_type"] = "predictive"
+            
+            # Generate forecast configuration
+            forecast_config = self.predictive_agent.generate_forecast_config(
+                state["user_input"],
+                state["query_data"],
+                state["query_results"]["columns"],
+                state["context"]
+            )
+            
+            if "error" not in forecast_config:
+                # Create forecast
+                forecast_results = self.predictive_agent.create_forecast(
+                    state["query_data"],
+                    forecast_config
+                )
+                state["forecast_results"] = forecast_results
+                state["predictive_model"] = forecast_config.get("model_type", "linear")
+                
+                # Update response with predictive insights
+                if "error" not in forecast_results:
+                    forecast_summary = f"\n\n## Predictive Analysis\n"
+                    forecast_summary += f"**Model Used:** {forecast_results.get('model', 'Unknown')}\n"
+                    forecast_summary += f"**Forecast Periods:** {forecast_results.get('periods', 'N/A')}\n"
+                    
+                    if 'forecasts' in forecast_results:
+                        forecasts = forecast_results['forecasts']
+                        if len(forecasts) > 0:
+                            forecast_summary += f"**Next Period Forecast:** {forecasts[0]:.2f}\n"
+                            if len(forecasts) > 1:
+                                forecast_summary += f"**Future Values:** {', '.join([f'{f:.2f}' for f in forecasts[:5]])}\n"
+                    
+                    if 'mae' in forecast_results:
+                        forecast_summary += f"**Model Accuracy (MAE):** {forecast_results['mae']:.2f}\n"
+                    
+                    state["final_response"] += forecast_summary
+                else:
+                    state["final_response"] += f"\n\nPredictive Analysis Error: {forecast_results['error']}"
+            else:
+                state["final_response"] += f"\n\nPredictive Analysis Error: {forecast_config['error']}"
+        else:
+            state["forecast_results"] = None
+        
+        return state
+    
+    def generate_prescriptive(self, state: AgentState) -> AgentState:
+        """Generate prescriptive analysis"""
+        if state["query_results"]["success"] and state["query_results"]["data"]:
+            # Determine analysis type
+            state["analysis_type"] = "prescriptive"
+            
+            # Generate simulation configuration
+            simulation_config = self.prescriptive_agent.generate_simulation_config(
+                state["user_input"],
+                state["query_data"],
+                state["query_results"]["columns"],
+                state["context"]
+            )
+            
+            if "error" not in simulation_config:
+                # Run simulation
+                simulation_results = self.prescriptive_agent.run_simulation(
+                    state["query_data"],
+                    simulation_config
+                )
+                state["simulation_results"] = simulation_results
+                state["simulation_parameters"] = simulation_config
+                
+                # Update response with prescriptive insights
+                if "error" not in simulation_results:
+                    simulation_summary = f"\n\n## Prescriptive Analysis\n"
+                    simulation_summary += f"**Analysis Type:** {simulation_results.get('simulation_type', 'Unknown')}\n"
+                    
+                    if 'baseline' in simulation_results:
+                        baseline = simulation_results['baseline']
+                        simulation_summary += f"**Baseline Value:** {baseline.get('value', 'N/A')}\n"
+                    
+                    if 'scenarios' in simulation_results:
+                        scenarios = simulation_results['scenarios']
+                        simulation_summary += f"**Scenarios Analyzed:** {len(scenarios)}\n"
+                        
+                        for i, scenario in enumerate(scenarios[:3]):  # Show top 3 scenarios
+                            name = scenario.get('name', f'Scenario {i+1}')
+                            result = scenario.get('result', 'N/A')
+                            change_percent = scenario.get('change_percent', 0)
+                            simulation_summary += f"- **{name}:** {result:.2f} ({change_percent:+.1f}%)\n"
+                    
+                    if 'variables' in simulation_results:
+                        variables = simulation_results['variables']
+                        simulation_summary += f"**Key Variables:** {len(variables)}\n"
+                        for var in variables[:3]:  # Show top 3 variables
+                            var_name = var.get('variable', 'Unknown')
+                            correlation = var.get('correlation', 0)
+                            simulation_summary += f"- **{var_name}:** Correlation = {correlation:.3f}\n"
+                    
+                    state["final_response"] += simulation_summary
+                else:
+                    state["final_response"] += f"\n\nPrescriptive Analysis Error: {simulation_results['error']}"
+            else:
+                state["final_response"] += f"\n\nPrescriptive Analysis Error: {simulation_config['error']}"
+        else:
+            state["simulation_results"] = None
+        
+        return state
+
     def handle_general(self, state: AgentState) -> AgentState:
         """Handle general queries"""
         available_tables = list(self.schema_inspector.get_schema_info().keys())
@@ -1229,7 +1863,13 @@ class SQLAgent:
             reflection_feedback=None,
             refined_response=None,
             chart_type=None,
-            visualization_data=None
+            visualization_data=None,
+            # New fields for predictive and prescriptive analysis
+            analysis_type=None,
+            forecast_results=None,
+            simulation_results=None,
+            predictive_model=None,
+            simulation_parameters=None
         )
         
         # Run the graph
@@ -1253,7 +1893,13 @@ class SQLAgent:
             "generated_sql": final_state.get("generated_sql"),
             "data_query_result": final_state.get("data_query_result"),
             "markdown_result": final_state.get("markdown_result"),
-            "visualization_result": final_state.get("visualization_result")
+            "visualization_result": final_state.get("visualization_result"),
+            # New analysis results
+            "analysis_type": final_state.get("analysis_type"),
+            "forecast_results": final_state.get("forecast_results"),
+            "simulation_results": final_state.get("simulation_results"),
+            "predictive_model": final_state.get("predictive_model"),
+            "simulation_parameters": final_state.get("simulation_parameters")
         }
 
 def show_db_config_form():
@@ -1283,7 +1929,7 @@ def show_db_config_form():
                 st.error(f"Database connection failed: {e}")
 
 def show_chat_interface():
-    st.title("Enhanced RAG SQL Agent with Visualization")
+    st.title("Advanced Analytics SQL Agent - Descriptive, Predictive & Prescriptive Analysis")
 
     if "messages" not in st.session_state:
         st.session_state.messages = []
@@ -1325,6 +1971,79 @@ def show_chat_interface():
                         image = Image.open(BytesIO(image_data))
                         st.image(image, caption="Data Visualization", use_column_width=True)
                 
+                # Display predictive analysis if available
+                if message.get("forecast_results") and "error" not in message["forecast_results"]:
+                    with st.expander("Predictive Analysis Results"):
+                        forecast_results = message["forecast_results"]
+                        st.subheader(f"Model: {forecast_results.get('model', 'Unknown')}")
+                        
+                        if 'forecasts' in forecast_results:
+                            st.write("**Forecasted Values:**")
+                            forecasts = forecast_results['forecasts'][:10]  # Show first 10
+                            forecast_df = pd.DataFrame({
+                                'Period': range(1, len(forecasts) + 1),
+                                'Forecast': forecasts
+                            })
+                            st.dataframe(forecast_df)
+                        
+                        if 'mae' in forecast_results:
+                            st.metric("Model Accuracy (MAE)", f"{forecast_results['mae']:.2f}")
+                        
+                        if 'historical_values' in forecast_results:
+                            st.write("**Historical vs Forecasted Trend:**")
+                            historical = forecast_results['historical_values']
+                            forecasts = forecast_results.get('forecasts', [])
+                            
+                            # Create trend visualization
+                            fig, ax = plt.subplots(figsize=(10, 4))
+                            hist_x = range(len(historical))
+                            forecast_x = range(len(historical), len(historical) + len(forecasts))
+                            
+                            ax.plot(hist_x, historical, label='Historical', marker='o')
+                            ax.plot(forecast_x, forecasts, label='Forecast', marker='s', linestyle='--')
+                            ax.legend()
+                            ax.set_title('Historical Data vs Forecast')
+                            st.pyplot(fig)
+                            plt.close()
+                
+                # Display prescriptive analysis if available
+                if message.get("simulation_results") and "error" not in message["simulation_results"]:
+                    with st.expander("Prescriptive Analysis Results"):
+                        simulation_results = message["simulation_results"]
+                        st.subheader(f"Analysis: {simulation_results.get('simulation_type', 'Unknown')}")
+                        
+                        if 'baseline' in simulation_results:
+                            baseline = simulation_results['baseline']
+                            st.metric("Baseline Value", f"{baseline.get('value', 'N/A')}")
+                        
+                        if 'scenarios' in simulation_results:
+                            st.write("**Scenario Analysis:**")
+                            scenarios_data = []
+                            for scenario in simulation_results['scenarios']:
+                                scenarios_data.append({
+                                    'Scenario': scenario.get('name', 'Unknown'),
+                                    'Result': scenario.get('result', 0),
+                                    'Change (%)': f"{scenario.get('change_percent', 0):+.1f}%",
+                                    'Description': scenario.get('description', '')
+                                })
+                            
+                            if scenarios_data:
+                                scenarios_df = pd.DataFrame(scenarios_data)
+                                st.dataframe(scenarios_df)
+                        
+                        if 'variables' in simulation_results:
+                            st.write("**Variable Sensitivity:**")
+                            variables_data = []
+                            for var in simulation_results['variables']:
+                                variables_data.append({
+                                    'Variable': var.get('variable', 'Unknown'),
+                                    'Correlation': f"{var.get('correlation', 0):.3f}"
+                                })
+                            
+                            if variables_data:
+                                variables_df = pd.DataFrame(variables_data)
+                                st.dataframe(variables_df)
+                
                 # Display markdown formatted response
                 if message.get("markdown_result"):
                     with st.expander("Detailed Analysis"):
@@ -1333,7 +2052,7 @@ def show_chat_interface():
                 st.markdown(message["content"])
 
     # Chat input
-    if prompt := st.chat_input("Ask a question about your data or request a visualization..."):
+    if prompt := st.chat_input("Ask questions, request visualizations, get forecasts, or run simulations on your data..."):
         st.session_state.messages.append({"role": "user", "content": prompt})
         with st.chat_message("user"):
             st.markdown(prompt)
@@ -1377,6 +2096,48 @@ def show_chat_interface():
                 if result.get("markdown_result"):
                     with st.expander("Detailed Analysis"):
                         st.markdown(result["markdown_result"])
+                
+                # Display predictive analysis if available
+                if result.get("forecast_results") and "error" not in result["forecast_results"]:
+                    with st.expander("Predictive Analysis Results"):
+                        forecast_results = result["forecast_results"]
+                        st.subheader(f"Model: {forecast_results.get('model', 'Unknown')}")
+                        
+                        if 'forecasts' in forecast_results:
+                            st.write("**Forecasted Values:**")
+                            forecasts = forecast_results['forecasts'][:10]  # Show first 10
+                            forecast_df = pd.DataFrame({
+                                'Period': range(1, len(forecasts) + 1),
+                                'Forecast': forecasts
+                            })
+                            st.dataframe(forecast_df)
+                        
+                        if 'mae' in forecast_results:
+                            st.metric("Model Accuracy (MAE)", f"{forecast_results['mae']:.2f}")
+                
+                # Display prescriptive analysis if available
+                if result.get("simulation_results") and "error" not in result["simulation_results"]:
+                    with st.expander("Prescriptive Analysis Results"):
+                        simulation_results = result["simulation_results"]
+                        st.subheader(f"Analysis: {simulation_results.get('simulation_type', 'Unknown')}")
+                        
+                        if 'baseline' in simulation_results:
+                            baseline = simulation_results['baseline']
+                            st.metric("Baseline Value", f"{baseline.get('value', 'N/A')}")
+                        
+                        if 'scenarios' in simulation_results:
+                            st.write("**Scenario Analysis:**")
+                            scenarios_data = []
+                            for scenario in simulation_results['scenarios']:
+                                scenarios_data.append({
+                                    'Scenario': scenario.get('name', 'Unknown'),
+                                    'Result': scenario.get('result', 0),
+                                    'Change (%)': f"{scenario.get('change_percent', 0):+.1f}%"
+                                })
+                            
+                            if scenarios_data:
+                                scenarios_df = pd.DataFrame(scenarios_data)
+                                st.dataframe(scenarios_df)
         
         # Save the complete result to session
         st.session_state.messages.append({
@@ -1385,7 +2146,10 @@ def show_chat_interface():
             "generated_sql": result.get("generated_sql"),
             "data_query_result": result.get("data_query_result"),
             "markdown_result": result.get("markdown_result"),
-            "visualization_result": result.get("visualization_result")
+            "visualization_result": result.get("visualization_result"),
+            "forecast_results": result.get("forecast_results"),
+            "simulation_results": result.get("simulation_results"),
+            "analysis_type": result.get("analysis_type")
         })
 
 def main():
