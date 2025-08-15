@@ -38,6 +38,8 @@ from sklearn.preprocessing import StandardScaler
 import warnings
 warnings.filterwarnings('ignore')
 
+import calendar
+
 # Time series forecasting imports
 try:
     from statsmodels.tsa.arima.model import ARIMA
@@ -383,6 +385,7 @@ class AgentState(TypedDict):
     simulation_results: Optional[Dict[str, Any]]
     predictive_model: Optional[str]  # ARIMA, Prophet, Linear, etc.
     simulation_parameters: Optional[Dict[str, Any]]
+    data_validation: Optional[Dict[str, Any]]  # Data validation results
 
 # Database Schema Inspector
 class SchemaInspector:
@@ -658,6 +661,30 @@ Return a JSON object with:
 """
         )
 
+    @staticmethod
+    def get_query_improvement_prompt():
+        return PromptTemplate(
+            input_variables=["original_query", "validation_issues", "user_intent"],
+            template="""
+You are a SQL optimization expert that improves queries for better visualization and analysis.
+
+Original Query: {original_query}
+Validation Issues: {validation_issues}
+User Intent: {user_intent}
+
+Based on the validation issues, suggest an improved SQL query that:
+1. Returns data suitable for visualization
+2. Has proper column names and data types
+3. Includes appropriate aggregate functions if needed
+4. Uses GROUP BY for categorical analysis when relevant
+5. Includes ORDER BY for logical data sorting
+6. Limits results if dealing with large datasets
+
+Return only the improved SQL query without any formatting or explanation.
+If the original query is already good, return it unchanged.
+"""
+        )
+
 # SQL Query Generator
 class SQLQueryGenerator:
     def __init__(self, llm: ChatGroq, schema_info: Dict[str, Any]):
@@ -766,14 +793,158 @@ class ReflectionAgent:
         response = self.llm.invoke(prompt)
         return response.content.strip()
 
+# Data Validation Agent
+class DataValidationAgent:
+    def __init__(self, llm: ChatGroq):
+        self.llm = llm
+    
+    def validate_data_for_visualization(self, query_results: Dict[str, Any], user_input: str) -> Dict[str, Any]:
+        """Validate if data is suitable for visualization and suggest improvements"""
+        if not query_results.get("success") or not query_results.get("data"):
+            return {
+                "is_valid": False,
+                "error": "No data available for visualization",
+                "suggestions": []
+            }
+        
+        data = query_results["data"]
+        columns = query_results["columns"]
+        
+        # Basic validation checks
+        validation_result = {
+            "is_valid": True,
+            "warnings": [],
+            "suggestions": [],
+            "chart_recommendations": [],
+            "axis_mapping": {}
+        }
+        
+        # Check data structure
+        if len(data) < 2:
+            validation_result["warnings"].append("Very few data points (less than 2 rows)")
+            if len(data) == 0:
+                validation_result["is_valid"] = False
+                validation_result["error"] = "No data rows to visualize"
+                return validation_result
+        
+        # Check column structure
+        if len(columns) < 1:
+            validation_result["is_valid"] = False
+            validation_result["error"] = "No columns available for visualization"
+            return validation_result
+        
+        # Analyze data types and suggest appropriate visualizations
+        df = pd.DataFrame(data)
+        numeric_columns = df.select_dtypes(include=[np.number]).columns.tolist()
+        categorical_columns = df.select_dtypes(include=['object', 'string']).columns.tolist()
+        datetime_columns = []
+        
+        # Try to detect datetime columns
+        for col in categorical_columns:
+            try:
+                pd.to_datetime(df[col], errors='raise')
+                datetime_columns.append(col)
+                categorical_columns.remove(col)
+            except:
+                continue
+        
+        # Determine best axis mapping
+        x_axis = None
+        y_axis = None
+        chart_type = "bar"  # default
+        
+        if datetime_columns:
+            # Time series data
+            x_axis = datetime_columns[0]
+            y_axis = numeric_columns[0] if numeric_columns else columns[1] if len(columns) > 1 else None
+            chart_type = "line"
+            validation_result["chart_recommendations"].append("Line chart recommended for time series data")
+        elif categorical_columns and numeric_columns:
+            # Categorical vs numeric
+            x_axis = categorical_columns[0]
+            y_axis = numeric_columns[0]
+            chart_type = "bar"
+            validation_result["chart_recommendations"].append("Bar chart recommended for categorical vs numeric data")
+        elif len(numeric_columns) >= 2:
+            # Multiple numeric columns
+            x_axis = numeric_columns[0]
+            y_axis = numeric_columns[1]
+            chart_type = "scatter"
+            validation_result["chart_recommendations"].append("Scatter plot recommended for numeric vs numeric data")
+        elif len(columns) >= 2:
+            # Fallback to first two columns
+            x_axis = columns[0]
+            y_axis = columns[1]
+            validation_result["warnings"].append("Using first two columns as axes - results may vary")
+        else:
+            # Single column
+            x_axis = columns[0]
+            y_axis = columns[0]
+            chart_type = "histogram"
+            validation_result["chart_recommendations"].append("Histogram recommended for single numeric column")
+        
+        validation_result["axis_mapping"] = {
+            "x_axis": x_axis,
+            "y_axis": y_axis,
+            "recommended_chart_type": chart_type
+        }
+        
+        # Additional validations based on chart type
+        if chart_type == "pie":
+            if len(data) > 10:
+                validation_result["warnings"].append("Too many categories for pie chart (>10), consider bar chart")
+                validation_result["axis_mapping"]["recommended_chart_type"] = "bar"
+        
+        # Check for null values
+        null_counts = df.isnull().sum()
+        if null_counts.any():
+            validation_result["warnings"].append(f"Null values found in columns: {null_counts[null_counts > 0].to_dict()}")
+        
+        # Data quality suggestions
+        if len(numeric_columns) == 0 and "visualization" in user_input.lower():
+            validation_result["suggestions"].append("Consider using aggregate functions (COUNT, SUM, AVG) to generate numeric data for better visualizations")
+        
+        if len(data) > 100:
+            validation_result["suggestions"].append("Large dataset detected. Consider using LIMIT clause or GROUP BY for cleaner visualizations")
+        
+        return validation_result
+    
+    def suggest_query_improvements(self, original_query: str, validation_result: Dict[str, Any], user_input: str = "") -> str:
+        """Suggest improvements to the SQL query for better visualization"""
+        if not validation_result or validation_result.get("is_valid", True):
+            return original_query
+        
+        # Use LLM to suggest improvements
+        try:
+            improvement_prompt = PromptTemplates.get_query_improvement_prompt()
+            issues = validation_result.get("error", "") + "; " + "; ".join(validation_result.get("warnings", []))
+            
+            prompt = improvement_prompt.format(
+                original_query=original_query,
+                validation_issues=issues,
+                user_intent=user_input
+            )
+            
+            response = self.llm.invoke(prompt)
+            improved_query = response.content.strip()
+            
+            # Clean the query
+            improved_query = improved_query.replace("```sql", "").replace("```", "").strip()
+            
+            return improved_query if improved_query else original_query
+            
+        except Exception as e:
+            logger.error(f"Error improving query: {e}")
+            return original_query
+
 # Visualization Agent
 class VisualizationAgent:
     def __init__(self, llm: ChatGroq):
         self.llm = llm
         self.viz_prompt = PromptTemplates.get_visualization_prompt()
         
-    def generate_chart_config(self, user_input: str, query_results: Dict[str, Any]) -> Dict[str, Any]:
-        """Generate chart configuration based on query results"""
+    def generate_chart_config(self, user_input: str, query_results: Dict[str, Any], validation_result: Dict[str, Any] = None) -> Dict[str, Any]:
+        """Generate chart configuration based on query results and validation"""
         if not query_results.get("success") or not query_results.get("data"):
             return {"error": "No data available for visualization"}
         
@@ -782,20 +953,44 @@ class VisualizationAgent:
         logger.info(data, "Query results data")
         logger.info(columns, "Query results columns")
         
-        # Create a fallback configuration first
-        fallback_config = {
-            "chart_type": "bar",
-            "title": "Data Visualization",
-            "x_axis": columns[0] if columns else None,
-            "y_axis": columns[1] if len(columns) > 1 else columns[0] if columns else None,
-            "description": "Auto-generated chart from query results"
-        }
+        # Use validation results if available
+        if validation_result and validation_result.get("axis_mapping"):
+            axis_mapping = validation_result["axis_mapping"]
+            fallback_config = {
+                "chart_type": axis_mapping.get("recommended_chart_type", "bar"),
+                "title": "Data Visualization",
+                "x_axis": axis_mapping.get("x_axis"),
+                "y_axis": axis_mapping.get("y_axis"),
+                "description": "Chart based on data validation recommendations"
+            }
+        else:
+            # Create a fallback configuration first
+            fallback_config = {
+                "chart_type": "bar",
+                "title": "Data Visualization",
+                "x_axis": columns[0] if columns else None,
+                "y_axis": columns[1] if len(columns) > 1 else columns[0] if columns else None,
+                "description": "Auto-generated chart from query results"
+            }
         
-        prompt = self.viz_prompt.format(
-            user_input=user_input,
-            query_results=str(data[:5]),  # First 5 rows for analysis
-            columns=str(columns)
-        )
+        # prompt = self.viz_prompt.format(
+        #     user_input=user_input,
+        #     query_results=str(data[:5]),  # First 5 rows for analysis
+        #     columns=str(columns)
+        # )
+
+        # Fix the string formatting issue - ensure all variables are strings
+        try:
+            prompt_data = {
+                "user_input": str(user_input),
+                "query_results": str(data[:5]) if data else "[]",  # First 5 rows for analysis
+                "columns": str(columns) if columns else "[]"
+            }
+            
+            prompt = self.viz_prompt.format(**prompt_data)
+        except (KeyError, ValueError) as e:
+            logger.warning(f"Prompt formatting error: {e}, using fallback config")
+            return fallback_config
         
         try:
             response = self.llm.invoke(prompt)
@@ -828,7 +1023,7 @@ class VisualizationAgent:
                 logger.warning("Invalid config format from LLM, using fallback")
                 return fallback_config
             
-            # Ensure required fields exist
+            # Ensure required fields exist, prioritizing validation results
             config.setdefault("chart_type", fallback_config["chart_type"])
             config.setdefault("title", fallback_config["title"])
             config.setdefault("x_axis", fallback_config["x_axis"])
@@ -844,27 +1039,61 @@ class VisualizationAgent:
             logger.error(f"Error generating chart config: {e}")
             return fallback_config
     
-    def create_visualization(self, query_results: Dict[str, Any], chart_config: Dict[str, Any]) -> str:
+    def create_visualization(self, query_results: Dict[str, Any], chart_config: Dict[str, Any], 
+                           forecast_results: Dict[str, Any] = None, simulation_results: Dict[str, Any] = None,
+                           validation_result: Dict[str, Any] = None) -> str:
         """Create visualization and return base64 encoded image"""
         try:
             if not query_results.get("success") or not query_results.get("data"):
                 return None
-            
-            # Convert to DataFrame
+
             df = pd.DataFrame(query_results["data"])
             
-            # Enhanced logic for axis determination based on your requirements
-            # If data has 2+ rows and 2+ columns, use column 1 as labels for axis and the rest as data
-            x_col = None
-            y_col = None
+            # Handle month number to month name conversion
+            if 'month' in df.columns and df['month'].dtype in ['int64', 'int32', 'float64']:
+                df['month_name'] = df['month'].apply(lambda x: calendar.month_name[int(x)] if pd.notna(x) and 1 <= x <= 12 else str(x))
+            elif 'month_name' in df.columns and df['month_name'].dtype == 'object':
+                df['month'] = df['month_name'].apply(lambda x: calendar.month_name.index(x) if x in calendar.month_name else None)
+                
+            # Determine if we should create continuous analysis visualization
+            has_analysis_data = (
+                forecast_results and not forecast_results.get("error") or
+                simulation_results and not simulation_results.get("error") or
+                self._has_multiple_analysis_columns(df)
+            )
             
-            if len(df) >= 2 and len(df.columns) >= 2:
-                # Column 1 (index 0) is label for the axis
-                x_col = df.columns[0]
-                # Column 2 (index 1) is the data for y-axis
-                y_col = df.columns[1] if len(df.columns) > 1 else None
+            if has_analysis_data:
+                # Create continuous analysis visualization
+                return self._create_continuous_analysis_chart(
+                    query_results=query_results,
+                    chart_config=chart_config,
+                    forecast_results=forecast_results,
+                    simulation_results=simulation_results
+                )
+            else:
+                # Create regular chart based on chart type
+                chart_type = chart_config.get("chart_type", "bar").lower()
+                x_col = chart_config.get("x_axis")
+                y_col = chart_config.get("y_axis")
+                title = chart_config.get("title", "Data Visualization")
             
-            # Override with chart config if provided
+            if validation_result and validation_result.get("axis_mapping"):
+                axis_mapping = validation_result["axis_mapping"]
+                x_col = axis_mapping.get("x_axis")
+                y_col = axis_mapping.get("y_axis")
+                chart_type = axis_mapping.get("recommended_chart_type", chart_config.get("chart_type", "bar"))
+            else:
+                # Enhanced logic for axis determination based on your requirements
+                # If data has 2+ rows and 2+ columns, use column 1 as labels for axis and the rest as data
+                if len(df) >= 2 and len(df.columns) >= 2:
+                    # Column 1 (index 0) is label for the axis
+                    x_col = df.columns[0]
+                    # Column 2 (index 1) is the data for y-axis
+                    y_col = df.columns[1] if len(df.columns) > 1 else None
+                
+                chart_type = chart_config.get("chart_type", "bar")
+            
+            # Override with chart config if provided and valid
             chart_x_col = chart_config.get("x_axis")
             chart_y_col = chart_config.get("y_axis")
             
@@ -873,14 +1102,27 @@ class VisualizationAgent:
             if chart_y_col and chart_y_col in df.columns:
                 y_col = chart_y_col
             
+            # Final validation - ensure we have valid columns
+            if not x_col or x_col not in df.columns:
+                x_col = df.columns[0] if len(df.columns) > 0 else None
+            if not y_col or y_col not in df.columns:
+                y_col = df.columns[1] if len(df.columns) > 1 else df.columns[0]
+            
             # Create figure
-            plt.figure(figsize=(10, 6))
+            plt.figure(figsize=(12, 8))
             plt.style.use('seaborn-v0_8')
             
-            chart_type = chart_config.get("chart_type", "bar")
             title = chart_config.get("title", "Data Visualization")
             
-            if chart_type == "bar":
+            # Check if we should create continuous analysis chart
+            has_forecast = forecast_results and "forecasts" in forecast_results
+            has_simulation = simulation_results and "scenarios" in simulation_results
+            has_forecast_col = any('forecast' in col.lower() for col in df.columns)
+            has_simulation_col = any('simulat' in col.lower() or 'scenario' in col.lower() for col in df.columns)
+            
+            if (has_forecast or has_simulation or has_forecast_col or has_simulation_col) and chart_type in ["line", "bar"]:
+                self._create_continuous_analysis_chart(df, x_col, y_col, title, forecast_results, simulation_results)
+            elif chart_type == "bar":
                 self._create_bar_chart(df, x_col, y_col, title)
             elif chart_type == "line":
                 self._create_line_chart(df, x_col, y_col, title)
@@ -892,6 +1134,11 @@ class VisualizationAgent:
                 self._create_histogram(df, x_col, title)
             else:
                 self._create_bar_chart(df, x_col, y_col, title)
+            
+            # Add validation warnings as subtitle if any
+            if validation_result and validation_result.get("warnings"):
+                warning_text = "; ".join(validation_result["warnings"][:2])  # Show max 2 warnings
+                plt.figtext(0.5, 0.02, f"Note: {warning_text}", ha='center', fontsize=8, style='italic', color='gray')
             
             # Convert to base64
             buffer = BytesIO()
@@ -921,6 +1168,252 @@ class VisualizationAgent:
         plt.xticks(rotation=45)
     
     def _create_line_chart(self, df: pd.DataFrame, x_col: str, y_col: str, title: str):
+        """Create a line chart"""
+        try:
+            plt.figure(figsize=(12, 8))
+            plt.plot(df[x_col], df[y_col], marker='o')
+            plt.title(title)
+            plt.xlabel(x_col)
+            plt.ylabel(y_col)
+            plt.grid(True, alpha=0.3)
+            plt.xticks(rotation=45)
+            plt.tight_layout()
+            
+            # Convert to base64
+            buffer = BytesIO()
+            plt.savefig(buffer, format='png', dpi=300, bbox_inches='tight')
+            buffer.seek(0)
+            image_base64 = base64.b64encode(buffer.getvalue()).decode()
+            plt.close()
+            
+            return image_base64
+            
+        except Exception as e:
+            logger.error(f"Error creating line chart: {e}")
+            return None
+
+    def _create_unified_continuous_chart(self, analysis_data: Dict[str, Any], chart_config: Dict[str, Any] = None) -> str:
+        """Create unified continuous chart from prepared analysis data"""
+        try:
+            plt.figure(figsize=(16, 10))
+            plt.style.use('seaborn-v0_8-darkgrid')
+            
+            df = analysis_data['dataframe']
+            time_col = analysis_data['time_column']
+            descriptive_cols = analysis_data['descriptive_columns']
+            predictive_cols = analysis_data['predictive_columns']
+            prescriptive_cols = analysis_data['prescriptive_columns']
+            
+            # Get time values
+            if time_col and time_col in df.columns:
+                time_values = df[time_col].values
+            else:
+                time_values = np.arange(len(df))
+            
+            # Color scheme
+            colors = {
+                'descriptive': '#2E86C1',      # Blue
+                'predictive': '#E74C3C',       # Red
+                'prescriptive': ['#F39C12', '#8E44AD', '#27AE60', '#E67E22', '#34495E']  # Various colors
+            }
+            
+            # Plot descriptive data (historical/actual)
+            for i, col in enumerate(descriptive_cols):
+                if col in df.columns:
+                    plt.plot(time_values, df[col], color=colors['descriptive'], linewidth=3,
+                            marker='o', markersize=6, label=f'Historical {col}', alpha=0.9, zorder=5)
+            
+            # Plot predictive data (forecasted)
+            for i, col in enumerate(predictive_cols):
+                if col in df.columns:
+                    plt.plot(time_values, df[col], color=colors['predictive'], linewidth=3,
+                            linestyle='--', marker='s', markersize=5, label=f'Forecast {col}',
+                            alpha=0.9, zorder=4)
+            
+            # Plot prescriptive data (scenarios/simulations)
+            for i, col in enumerate(prescriptive_cols):
+                if col in df.columns:
+                    color = colors['prescriptive'][i % len(colors['prescriptive'])]
+                    # Calculate percent change from descriptive if available
+                    if descriptive_cols and descriptive_cols[0] in df.columns:
+                        base_values = df[descriptive_cols[0]].dropna()
+                        scenario_values = df[col].dropna()
+                        if len(base_values) > 0 and len(scenario_values) > 0:
+                            change_percent = ((scenario_values.iloc[-1] - base_values.iloc[-1]) / 
+                                           base_values.iloc[-1] * 100)
+                            label = f"{col} ({change_percent:+.1f}%)"
+                        else:
+                            label = col
+                    else:
+                        label = col
+                    
+                    plt.plot(time_values, df[col], color=color, linewidth=2.5,
+                            linestyle='-.', marker='^', markersize=5, label=label,
+                            alpha=0.8, zorder=3)
+            
+            # Enhanced formatting
+            title = chart_config.get('title', 'Continuous Analysis: Descriptive → Predictive → Prescriptive') if chart_config else 'Continuous Analysis'
+            plt.title(f'{title}', fontsize=16, fontweight='bold', pad=20)
+            
+            x_label = time_col if time_col else 'Time Period'
+            y_label = descriptive_cols[0] if descriptive_cols else 'Value'
+            plt.xlabel(x_label, fontsize=14, fontweight='semibold')
+            plt.ylabel(y_label, fontsize=14, fontweight='semibold')
+            
+            # Add phase separators
+            self._add_phase_separators(time_values, df, descriptive_cols, predictive_cols, prescriptive_cols)
+            
+            # Grid and legend
+            plt.grid(True, alpha=0.3, linestyle='-', linewidth=0.5)
+            plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=11, framealpha=0.9)
+            plt.tight_layout()
+            
+            # Convert to base64
+            buffer = BytesIO()
+            plt.savefig(buffer, format='png', dpi=300, bbox_inches='tight', facecolor='white')
+            buffer.seek(0)
+            image_base64 = base64.b64encode(buffer.getvalue()).decode()
+            plt.close()
+            
+            return image_base64
+            
+        except Exception as e:
+            logger.error(f"Error creating unified continuous chart: {e}")
+            return None
+
+    def _add_phase_separators(self, time_values, df, descriptive_cols, predictive_cols, prescriptive_cols):
+        """Add visual separators between analysis phases"""
+        y_min, y_max = plt.ylim()
+        y_range = y_max - y_min
+        
+        # Historical-Forecast separator
+        if descriptive_cols and predictive_cols:
+            desc_mask = pd.notna(df[descriptive_cols[0]])
+            if desc_mask.any():
+                last_desc_idx = desc_mask[::-1].idxmax()
+                sep_x = time_values[last_desc_idx]
+                
+                plt.axvline(x=sep_x, color='gray', linestyle='--', alpha=0.6, linewidth=1.5, zorder=0)
+                plt.text(sep_x, y_max - 0.05 * y_range, 'Forecast Begin', 
+                        rotation=90, verticalalignment='top', fontsize=10, alpha=0.8,
+                        bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.8))
+        
+        # Forecast-Scenario separator
+        if predictive_cols and prescriptive_cols:
+            pred_mask = pd.notna(df[predictive_cols[0]])
+            if pred_mask.any():
+                last_pred_idx = pred_mask[::-1].idxmax()
+                sep_x = time_values[last_pred_idx]
+                
+                plt.axvline(x=sep_x, color='gray', linestyle=':', alpha=0.6, linewidth=1.5, zorder=0)
+                plt.text(sep_x, y_max - 0.15 * y_range, 'Scenarios', 
+                        rotation=90, verticalalignment='top', fontsize=10, alpha=0.8,
+                        bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.8))
+
+    def _create_multi_phase_continuous_chart(self, df: pd.DataFrame, chart_config: Dict[str, Any],
+                                           forecast_results: Dict[str, Any] = None, 
+                                           simulation_results: Dict[str, Any] = None) -> str:
+        """Create continuous chart from separate analysis results"""
+        try:
+            plt.figure(figsize=(16, 10))
+            plt.style.use('seaborn-v0_8-darkgrid')
+            
+            # Build unified dataset for continuous visualization
+            columns = df.columns.tolist()
+            x_col = chart_config.get("x_axis") if chart_config else columns[0]
+            y_col = chart_config.get("y_axis") if chart_config else (columns[1] if len(columns) > 1 else columns[0])
+            
+            # Extract historical data
+            if x_col in df.columns and y_col in df.columns:
+                historical_x = df[x_col].values
+                historical_y = df[y_col].values
+            else:
+                historical_x = np.arange(len(df))
+                historical_y = df.iloc[:, 0].values if len(df.columns) > 0 else np.array([])
+            
+            # Sort historical data by x-axis
+            if len(historical_x) > 1:
+                sort_idx = np.argsort(historical_x)
+                historical_x = historical_x[sort_idx]
+                historical_y = historical_y[sort_idx]
+            
+            # Plot historical data
+            plt.plot(historical_x, historical_y, color='#2E86C1', linewidth=3, marker='o',
+                    markersize=6, label='Historical Data', alpha=0.9, zorder=5)
+            
+            # Add forecast data if available
+            if forecast_results and "forecasts" in forecast_results and not forecast_results.get("error"):
+                forecasts = np.array(forecast_results["forecasts"])
+                if len(forecasts) > 0:
+                    last_historical_x = historical_x[-1]
+                    forecast_x = np.arange(last_historical_x + 1, last_historical_x + len(forecasts) + 1)
+                    
+                    # Plot forecast line with connection to historical
+                    plt.plot([historical_x[-1], forecast_x[0]], 
+                            [historical_y[-1], forecasts[0]], 
+                            color='#E74C3C', linewidth=3, linestyle='--', alpha=0.9, zorder=4)
+                    
+                    plt.plot(forecast_x, forecasts, color='#E74C3C', linewidth=3, linestyle='--',
+                            marker='s', markersize=5, label='Forecast', alpha=0.9, zorder=4)
+                    
+                    # Add confidence intervals if available
+                    if "lower_bound" in forecast_results and "upper_bound" in forecast_results:
+                        lower_bound = np.array(forecast_results["lower_bound"])
+                        upper_bound = np.array(forecast_results["upper_bound"])
+                        plt.fill_between(forecast_x, lower_bound, upper_bound,
+                                       color='#E74C3C', alpha=0.2, label='95% Confidence')
+            
+            # Add simulation scenarios if available
+            if simulation_results and "scenarios" in simulation_results and not simulation_results.get("error"):
+                scenarios = simulation_results["scenarios"]
+                colors = ['#F39C12', '#8E44AD', '#27AE60', '#E67E22', '#34495E']
+                
+                for i, scenario in enumerate(scenarios[:5]):  # Show up to 5 scenarios
+                    if "values" in scenario and len(scenario["values"]) > 0:
+                        values = np.array(scenario["values"])
+                        scenario_x = np.arange(historical_x[-1], historical_x[-1] + len(values))
+                        
+                        # Calculate percentage change from baseline
+                        change_percent = ((values[-1] - historical_y[-1]) / historical_y[-1] * 100 
+                                        if len(historical_y) > 0 else 0)
+                        
+                        # Determine line style based on performance
+                        color = colors[i % len(colors)]
+                        if change_percent > 0:
+                            linestyle = '-.'
+                            alpha = 0.9
+                        else:
+                            linestyle = ':'
+                            alpha = 0.7
+                        
+                        plt.plot(scenario_x, values, color=color, linewidth=2.5, linestyle=linestyle,
+                                marker='^', markersize=5, alpha=alpha,
+                                label=f"{scenario['name']} ({change_percent:+.1f}%)", zorder=3)
+            
+            # Enhanced formatting
+            title = chart_config.get('title', 'Continuous Analysis: Historical → Forecast → Scenarios')
+            plt.title(title, fontsize=16, fontweight='bold', pad=20)
+            plt.xlabel(x_col, fontsize=14, fontweight='semibold')
+            plt.ylabel(y_col, fontsize=14, fontweight='semibold')
+            
+            # Grid and legend
+            plt.grid(True, alpha=0.3, linestyle='-', linewidth=0.5)
+            plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=11, framealpha=0.9)
+            plt.tight_layout()
+            
+            # Convert to base64
+            buffer = BytesIO()
+            plt.savefig(buffer, format='png', dpi=300, bbox_inches='tight', facecolor='white')
+            buffer.seek(0)
+            image_base64 = base64.b64encode(buffer.getvalue()).decode()
+            plt.close()
+            
+            return image_base64
+            
+        except Exception as e:
+            logger.error(f"Error creating multi-phase continuous chart: {e}")
+            return None
+
         if x_col and y_col and x_col in df.columns and y_col in df.columns:
             plt.plot(df[x_col], df[y_col], marker='o')
             plt.xlabel(x_col)
@@ -966,6 +1459,191 @@ class VisualizationAgent:
                 plt.xlabel(numeric_cols[0])
         plt.title(title)
         plt.ylabel('Frequency')
+    
+    def _create_continuous_analysis_chart(self, df: pd.DataFrame, x_col: str, y_col: str, title: str, 
+                                        forecast_results: Dict[str, Any] = None, simulation_results: Dict[str, Any] = None):
+        """Create continuous line chart showing descriptive → predictive → prescriptive analysis"""
+        try:
+            # Check if DataFrame contains forecast/simulation columns
+            has_forecast_col = any('forecast' in col.lower() for col in df.columns)
+            has_simulation_col = any('simulat' in col.lower() or 'scenario' in col.lower() for col in df.columns)
+            
+            # Extract axis values
+            if x_col and x_col in df.columns:
+                x_values = df[x_col].values
+            else:
+                x_values = np.arange(len(df))
+            
+            # Sort by x-axis to ensure proper line progression
+            if len(x_values) > 1:
+                sorted_indices = np.argsort(x_values)
+                x_values = x_values[sorted_indices]
+                df_sorted = df.iloc[sorted_indices]
+            else:
+                df_sorted = df
+            
+            plt.figure(figsize=(16, 8))
+            
+            # Plot historical data (descriptive analysis)
+            if y_col and y_col in df.columns:
+                historical_values = df_sorted[y_col].values
+                plt.plot(x_values, historical_values, 'o-', linewidth=3, markersize=7, 
+                        color='#2E86C1', label='Historical Data', alpha=0.9, zorder=3)
+            
+            # Handle forecasted data from DataFrame columns or forecast_results
+            forecast_x = []
+            forecast_y = []
+            
+            # First check if forecast data is in DataFrame columns
+            if has_forecast_col:
+                for col in df.columns:
+                    if 'forecast' in col.lower():
+                        forecast_col_data = df_sorted[col].dropna().values
+                        if len(forecast_col_data) > 0:
+                            # Use same x-axis positions but extend for forecast
+                            forecast_x = x_values[:len(forecast_col_data)]
+                            forecast_y = forecast_col_data
+                            
+                            # Find connection point between historical and forecast
+                            if y_col and y_col in df.columns:
+                                historical_data = df_sorted[y_col].values
+                                # Connect last historical point to first forecast point
+                                connection_x = [x_values[len(historical_data)-1], forecast_x[0]]
+                                connection_y = [historical_data[-1], forecast_y[0]]
+                                plt.plot(connection_x, connection_y, '--', linewidth=2, 
+                                        color='#E74C3C', alpha=0.6)
+                            
+                            plt.plot(forecast_x, forecast_y, '--', linewidth=3, marker='s', markersize=6,
+                                    color='#E74C3C', label='Forecasted Data', alpha=0.8, zorder=2)
+                        break
+            
+            # If not in DataFrame, use forecast_results
+            elif forecast_results and "forecasts" in forecast_results:
+                forecasts = forecast_results["forecasts"]
+                if forecasts and y_col and y_col in df.columns:
+                    historical_values = df_sorted[y_col].values
+                    last_x = x_values[-1] if len(x_values) > 0 else 0
+                    
+                    # Generate x-axis values for forecast
+                    if len(x_values) > 1:
+                        x_step = x_values[-1] - x_values[-2] if len(x_values) > 1 else 1
+                    else:
+                        x_step = 1
+                    
+                    forecast_x = [last_x + (i + 1) * x_step for i in range(len(forecasts))]
+                    forecast_y = forecasts
+                    
+                    # Connect historical to forecast
+                    combined_x = np.concatenate([[x_values[-1]], forecast_x])
+                    combined_y = np.concatenate([[historical_values[-1]], forecast_y])
+                    
+                    plt.plot(combined_x, combined_y, '--', linewidth=3, marker='s', markersize=6,
+                            color='#E74C3C', label='Forecasted Data', alpha=0.8, zorder=2)
+                    
+                    # Add confidence intervals if available
+                    if "confidence_lower" in forecast_results and "confidence_upper" in forecast_results:
+                        conf_lower = forecast_results["confidence_lower"]
+                        conf_upper = forecast_results["confidence_upper"]
+                        plt.fill_between(forecast_x, conf_lower, conf_upper, 
+                                       alpha=0.2, color='#E74C3C', label='Forecast Confidence')
+            
+            # Handle simulation data from DataFrame columns or simulation_results
+            if has_simulation_col:
+                colors = ['#F39C12', '#8E44AD', '#27AE60', '#E67E22', '#34495E']
+                color_idx = 0
+                
+                for col in df.columns:
+                    if 'simulat' in col.lower() or 'scenario' in col.lower():
+                        sim_col_data = df_sorted[col].dropna().values
+                        if len(sim_col_data) > 0:
+                            sim_x = x_values[:len(sim_col_data)]
+                            
+                            # Connect to last forecast point or historical point
+                            if forecast_x and len(forecast_x) > 0:
+                                connection_x = [forecast_x[-1], sim_x[0]]
+                                connection_y = [forecast_y[-1], sim_col_data[0]]
+                            elif y_col and y_col in df.columns:
+                                historical_values = df_sorted[y_col].values
+                                connection_x = [x_values[-1], sim_x[0]]
+                                connection_y = [historical_values[-1], sim_col_data[0]]
+                            else:
+                                connection_x, connection_y = [], []
+                            
+                            if connection_x:
+                                plt.plot(connection_x, connection_y, ':', linewidth=2, 
+                                        color=colors[color_idx % len(colors)], alpha=0.6)
+                            
+                            plt.plot(sim_x, sim_col_data, ':', linewidth=3, marker='^', markersize=6,
+                                    color=colors[color_idx % len(colors)], 
+                                    label=f'Scenario: {col}', alpha=0.8, zorder=1)
+                            color_idx += 1
+            
+            # If not in DataFrame, use simulation_results
+            elif simulation_results and "scenarios" in simulation_results:
+                scenarios = simulation_results["scenarios"]
+                colors = ['#F39C12', '#8E44AD', '#27AE60', '#E67E22', '#34495E']
+                
+                for i, scenario in enumerate(scenarios[:5]):
+                    if "result" in scenario:
+                        scenario_value = scenario["result"]
+                        scenario_name = scenario.get("name", f"Scenario {i+1}")
+                        
+                        # Determine connection point
+                        if forecast_x and len(forecast_x) > 0:
+                            start_x = forecast_x[-1]
+                            start_y = forecast_y[-1]
+                            x_step = forecast_x[-1] - forecast_x[-2] if len(forecast_x) > 1 else 1
+                        elif y_col and y_col in df.columns:
+                            historical_values = df_sorted[y_col].values
+                            start_x = x_values[-1]
+                            start_y = historical_values[-1]
+                            x_step = x_values[-1] - x_values[-2] if len(x_values) > 1 else 1
+                        else:
+                            continue
+                        
+                        sim_x = [start_x, start_x + x_step]
+                        sim_y = [start_y, scenario_value]
+                        
+                        plt.plot(sim_x, sim_y, ':', linewidth=3, marker='^', markersize=6,
+                                color=colors[i % len(colors)], label=f'{scenario_name}', 
+                                alpha=0.8, zorder=1)
+            
+            # Enhance the chart appearance
+            plt.title(f'{title}\nContinuous Analysis: Historical → Forecast → Scenarios', 
+                     fontsize=16, fontweight='bold', pad=20)
+            plt.xlabel(x_col if x_col else 'Time/Sequence', fontsize=14)
+            plt.ylabel(y_col if y_col else 'Values', fontsize=14)
+            
+            # Improved legend positioning
+            plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=11)
+            plt.grid(True, alpha=0.3, linestyle='-', linewidth=0.5)
+            
+            # Add phase separators and annotations
+            y_min, y_max = plt.ylim()
+            y_range = y_max - y_min
+            
+            # Historical-Forecast separator
+            if forecast_x or has_forecast_col:
+                sep_x = x_values[-1] if len(x_values) > 0 else 0
+                plt.axvline(x=sep_x, color='gray', linestyle='--', alpha=0.6, linewidth=1.5)
+                plt.text(sep_x, y_max - 0.05 * y_range, 'Forecast Begin', 
+                        rotation=90, verticalalignment='top', fontsize=10, alpha=0.8,
+                        bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.7))
+            
+            # Forecast-Simulation separator
+            if (forecast_x and (has_simulation_col or (simulation_results and "scenarios" in simulation_results))):
+                sep_x = forecast_x[-1] if forecast_x else x_values[-1]
+                plt.axvline(x=sep_x, color='gray', linestyle=':', alpha=0.6, linewidth=1.5)
+                plt.text(sep_x, y_max - 0.15 * y_range, 'Scenarios', 
+                        rotation=90, verticalalignment='top', fontsize=10, alpha=0.8,
+                        bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.7))
+            
+            plt.tight_layout()
+            
+        except Exception as e:
+            logger.error(f"Error creating continuous analysis chart: {e}")
+            # Fallback to simple line chart
+            self._create_line_chart(df, x_col, y_col, title)
 
 # Predictive Analysis Agent
 class PredictiveAnalysisAgent:
@@ -1381,6 +2059,7 @@ class SQLAgent:
         self.reflection_agent = ReflectionAgent(self.llm)
         self.predictive_agent = PredictiveAnalysisAgent(self.llm)
         self.prescriptive_agent = PrescriptiveAnalysisAgent(self.llm)
+        self.validation_agent = DataValidationAgent(self.llm)
         
         # Router prompt
         self.router_prompt = PromptTemplates.get_router_prompt()
@@ -1396,6 +2075,8 @@ class SQLAgent:
         workflow.add_node("route_query", self.route_query)
         workflow.add_node("generate_sql", self.generate_sql)
         workflow.add_node("execute_sql", self.execute_sql)
+        workflow.add_node("validate_data", self.validate_data)
+        workflow.add_node("improve_query", self.improve_query)
         workflow.add_node("reflect_response", self.reflect_response)
         workflow.add_node("refine_response", self.refine_response)
         workflow.add_node("generate_visualization", self.generate_visualization)
@@ -1420,7 +2101,18 @@ class SQLAgent:
         )
         
         workflow.add_edge("generate_sql", "execute_sql")
-        workflow.add_edge("execute_sql", "format_sql_response")
+        workflow.add_edge("execute_sql", "validate_data")
+        
+        workflow.add_conditional_edges(
+            "validate_data",
+            self.check_query_improvement_needed,
+            {
+                "improve": "improve_query",
+                "continue": "format_sql_response"
+            }
+        )
+        
+        workflow.add_edge("improve_query", "execute_sql")  # Re-execute with improved query
         workflow.add_edge("format_sql_response", "reflect_response")
         workflow.add_edge("reflect_response", "refine_response")
         
@@ -1428,16 +2120,34 @@ class SQLAgent:
             "refine_response",
             self.check_analysis_needed,
             {
-                "visualization": "generate_visualization",
                 "predictive": "generate_predictive",
+                "prescriptive": "generate_prescriptive", 
+                "visualization": "generate_visualization",
+                "complete": "finalize_response"
+            }
+        )
+        
+        # Sequential flow for analysis types
+        workflow.add_conditional_edges(
+            "generate_predictive",
+            self.check_next_analysis,
+            {
                 "prescriptive": "generate_prescriptive",
+                "visualization": "generate_visualization",
+                "complete": "finalize_response"
+            }
+        )
+        
+        workflow.add_conditional_edges(
+            "generate_prescriptive", 
+            self.check_next_analysis,
+            {
+                "visualization": "generate_visualization",
                 "complete": "finalize_response"
             }
         )
         
         workflow.add_edge("generate_visualization", "finalize_response")
-        workflow.add_edge("generate_predictive", "finalize_response")
-        workflow.add_edge("generate_prescriptive", "finalize_response")
         workflow.add_edge("handle_general", "finalize_response")
         workflow.add_edge("finalize_response", END)
         
@@ -1577,6 +2287,72 @@ class SQLAgent:
         state["data_query_result"] = state["query_results"]
         return state
     
+    def validate_data(self, state: AgentState) -> AgentState:
+        """Validate data quality and suitability for visualization"""
+        if state["query_results"]["success"] and "visualization" in state["query_types"]:
+            # Validate data for visualization
+            validation_result = self.validation_agent.validate_data_for_visualization(
+                state["query_results"], 
+                state["user_input"]
+            )
+            state["data_validation"] = validation_result
+            
+            # Add validation feedback to response if there are issues
+            if not validation_result.get("is_valid"):
+                state["final_response"] += f"\n\n**Data Validation:** {validation_result.get('error', 'Data quality issues detected')}"
+            elif validation_result.get("warnings"):
+                warnings_text = "; ".join(validation_result["warnings"])
+                state["final_response"] += f"\n\n**Data Quality Notes:** {warnings_text}"
+            
+            # Add suggestions if any
+            if validation_result.get("suggestions"):
+                suggestions_text = "; ".join(validation_result["suggestions"])
+                state["final_response"] += f"\n\n**Suggestions:** {suggestions_text}"
+        else:
+            state["data_validation"] = None
+        
+        return state
+    
+    def check_query_improvement_needed(self, state: AgentState) -> str:
+        """Check if query needs improvement based on validation"""
+        validation_result = state.get("data_validation")
+        
+        # Skip improvement if not doing visualization or if already improved once
+        if "visualization" not in state["query_types"] or state.get("query_improved", False):
+            return "continue"
+        
+        # Improve if validation failed or has significant warnings
+        if validation_result and (
+            not validation_result.get("is_valid") or
+            len(validation_result.get("warnings", [])) > 1
+        ):
+            return "improve"
+        
+        return "continue"
+    
+    def improve_query(self, state: AgentState) -> AgentState:
+        """Improve SQL query based on validation feedback"""
+        validation_result = state.get("data_validation")
+        if not validation_result:
+            return state
+        
+        # Get improved query suggestion
+        improved_query = self.validation_agent.suggest_query_improvements(
+            state["sql_query"],
+            validation_result,
+            state["user_input"]
+        )
+        
+        if improved_query != state["sql_query"]:
+            state["sql_query"] = improved_query
+            state["generated_sql"] = improved_query
+            state["query_improved"] = True
+            logger.info(f"Improved SQL Query: {improved_query}")
+        else:
+            state["query_improved"] = True  # Mark as processed to avoid loops
+        
+        return state
+    
     def format_sql_response(self, state: AgentState) -> AgentState:
         """Format the SQL response"""
         results = state["query_results"]
@@ -1636,24 +2412,58 @@ class SQLAgent:
         else:
             return "complete"
     
+    def check_next_analysis(self, state: AgentState) -> str:
+        """Check what analysis type should run next in sequence"""
+        query_types = state["query_types"]
+        
+        # Check what analyses have been completed
+        has_predictive = state.get("forecast_results") is not None
+        has_prescriptive = state.get("simulation_results") is not None
+        
+        # Determine next step
+        if "prescriptive" in query_types and not has_prescriptive:
+            return "prescriptive"
+        elif "visualization" in query_types:
+            return "visualization"
+        else:
+            return "complete"
+    
     def generate_visualization(self, state: AgentState) -> AgentState:
         """Generate visualization"""
         if state["query_results"]["success"] and state["query_results"]["data"]:
-            # Generate chart configuration
+            # Get validation results
+            validation_result = state.get("data_validation")
+            
+            # Skip visualization if data validation failed
+            if validation_result and not validation_result.get("is_valid"):
+                state["visualization_result"] = None
+                state["final_response"] += f"\n\nVisualization skipped: {validation_result.get('error', 'Data validation failed')}"
+                return state
+            
+            # Generate chart configuration with validation context
             chart_config = self.visualization_agent.generate_chart_config(
                 state["user_input"],
-                state["query_results"]
+                state["query_results"],
+                validation_result
             )
             
             if "error" not in chart_config:
-                # Create visualization
+                # Create visualization with forecast, simulation data, and validation results
                 viz_base64 = self.visualization_agent.create_visualization(
                     state["query_results"],
-                    chart_config
+                    chart_config,
+                    state.get("forecast_results"),
+                    state.get("simulation_results"),
+                    validation_result
                 )
                 state["visualization_result"] = viz_base64
                 state["chart_type"] = chart_config.get("chart_type", "bar")
                 state["visualization_data"] = chart_config
+                
+                # Add chart recommendations to response
+                if validation_result and validation_result.get("chart_recommendations"):
+                    recommendations_text = "; ".join(validation_result["chart_recommendations"])
+                    state["final_response"] += f"\n\n**Chart Recommendations:** {recommendations_text}"
             else:
                 state["visualization_result"] = None
                 state["final_response"] += f"\n\nVisualization Error: {chart_config['error']}"
@@ -1869,7 +2679,8 @@ class SQLAgent:
             forecast_results=None,
             simulation_results=None,
             predictive_model=None,
-            simulation_parameters=None
+            simulation_parameters=None,
+            data_validation=None
         )
         
         # Run the graph
