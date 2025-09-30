@@ -75,7 +75,7 @@ class Config:
     MONGODB_URL = os.getenv("MONGODB_URL", "mongodb://localhost:27017")
     POSTGRES_URL: Optional[str] = os.getenv("POSTGRES_URL")
     DATABASE_NAME = os.getenv("DATABASE_NAME", "rag_chatbot")
-    GROQ_MODEL = os.getenv("GROQ_MODEL", "llama3-8b-8192")
+    GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 
 # Pydantic models for structured responses
 class ChatRequest(BaseModel):
@@ -1061,15 +1061,25 @@ class VisualizationAgent:
                 simulation_results and not simulation_results.get("error") or
                 self._has_multiple_analysis_columns(df)
             )
+            logger.info(f"Has analysis data: {has_analysis_data}")
+            logger.info(f"Forecast results: {forecast_results}")
+            logger.info(f"Simulation results: {simulation_results}")
+            logger.info(f"Chart config: {chart_config}")
+            logger.info(f"Validation result: {df}")
             
             if has_analysis_data:
-                # Create continuous analysis visualization
-                return self._create_continuous_analysis_chart(
-                    query_results=query_results,
+                # Build unified multi-line analysis visualization
+                analysis_data = self._prepare_unified_analysis_data(
+                    df=df,
                     chart_config=chart_config,
                     forecast_results=forecast_results,
-                    simulation_results=simulation_results
+                    simulation_results=simulation_results,
+                    prefer_last_table=True
                 )
+                img = self._create_unified_continuous_chart(analysis_data, chart_config)
+                # Ensure downstream sees this as a line chart
+                chart_config["chart_type"] = "line"
+                return img
             else:
                 # Create regular chart based on chart type
                 chart_type = chart_config.get("chart_type", "bar").lower()
@@ -1088,8 +1098,12 @@ class VisualizationAgent:
                 if len(df) >= 2 and len(df.columns) >= 2:
                     # Column 1 (index 0) is label for the axis
                     x_col = df.columns[0]
-                    # Column 2 (index 1) is the data for y-axis
-                    y_col = df.columns[1] if len(df.columns) > 1 else None
+                    # Column 2 (index 1) is the data for y-axis (descriptive only: first table). If analysis, use last numeric (last table)
+                    if has_analysis_data:
+                        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+                        y_col = numeric_cols[-1] if numeric_cols else (df.columns[-1] if len(df.columns) > 1 else None)
+                    else:
+                        y_col = df.columns[1] if len(df.columns) > 1 else None
                 
                 chart_type = chart_config.get("chart_type", "bar")
             
@@ -1121,7 +1135,19 @@ class VisualizationAgent:
             has_simulation_col = any('simulat' in col.lower() or 'scenario' in col.lower() for col in df.columns)
             
             if (has_forecast or has_simulation or has_forecast_col or has_simulation_col) and chart_type in ["line", "bar"]:
-                self._create_continuous_analysis_chart(df, x_col, y_col, title, forecast_results, simulation_results)
+                # Prefer unified multi-line line chart
+                analysis_data = self._prepare_unified_analysis_data(
+                    df=df,
+                    chart_config=chart_config,
+                    forecast_results=forecast_results,
+                    simulation_results=simulation_results,
+                    prefer_last_table=True
+                )
+                # Force multi-line line chart for analysis phases
+                chart_config = dict(chart_config)
+                chart_config["title"] = chart_config.get("title", "Continuous Analysis: Historical → Forecast → Scenarios")
+                chart_config["chart_type"] = "line"
+                return self._create_unified_continuous_chart(analysis_data, chart_config)
             elif chart_type == "bar":
                 self._create_bar_chart(df, x_col, y_col, title)
             elif chart_type == "line":
@@ -1152,6 +1178,192 @@ class VisualizationAgent:
         except Exception as e:
             logger.error(f"Error creating visualization: {e}")
             return None
+
+    def _prepare_unified_analysis_data(self, df: pd.DataFrame, chart_config: Dict[str, Any],
+                                       forecast_results: Dict[str, Any] = None,
+                                       simulation_results: Dict[str, Any] = None,
+                                       prefer_last_table: bool = True) -> Dict[str, Any]:
+        """Prepare a unified dataframe combining historical (descriptive), forecast (predictive), and scenarios (prescriptive).
+        - Descriptive (historical) uses the first numeric column by default; if prefer_last_table, use last numeric column.
+        - Predictive adds a 'Forecast' series appended after historical.
+        - Prescriptive adds one series per scenario (values or adjusted forecast by change_percent).
+        Returns a dict with dataframe, time_column, and column groups for plotting.
+        """
+        try:
+            work_df = df.copy()
+
+            # Identify time and value columns
+            candidate_time_cols = [
+                'date', 'created_at', 'updated_at', 'timestamp', 'time', 'period', 'month_name', 'month'
+            ]
+            time_col = None
+            for c in work_df.columns:
+                if c.lower() in candidate_time_cols:
+                    time_col = c
+                    break
+
+            if time_col is None and len(work_df.columns) > 0:
+                # Try to infer datetime
+                for c in work_df.columns:
+                    if pd.api.types.is_datetime64_any_dtype(work_df[c]):
+                        time_col = c
+                        break
+                # Fallback to first column as time label
+                if time_col is None:
+                    time_col = work_df.columns[0]
+
+            # Normalize month values if necessary
+            if time_col == 'month' and pd.api.types.is_numeric_dtype(work_df['month']):
+                work_df['month_name'] = work_df['month'].apply(lambda x: calendar.month_name[int(x)] if pd.notna(x) and 1 <= int(x) <= 12 else str(x))
+                time_col = 'month_name'
+
+            numeric_cols = work_df.select_dtypes(include=[np.number]).columns.tolist()
+            if not numeric_cols:
+                # Try to coerce any suitable columns
+                for c in work_df.columns:
+                    try:
+                        work_df[c] = pd.to_numeric(work_df[c])
+                    except Exception:
+                        pass
+                numeric_cols = work_df.select_dtypes(include=[np.number]).columns.tolist()
+
+            if not numeric_cols:
+                # Nothing to plot meaningfully
+                return {
+                    'dataframe': work_df,
+                    'time_column': time_col,
+                    'descriptive_columns': [],
+                    'predictive_columns': [],
+                    'prescriptive_columns': []
+                }
+
+            # Choose value column according to rule (first for descriptive-only, last when analysis present)
+            analysis_present = bool((forecast_results and 'forecasts' in forecast_results) or (simulation_results and 'scenarios' in simulation_results))
+            if analysis_present and prefer_last_table:
+                value_col = numeric_cols[-1]
+            else:
+                value_col = numeric_cols[0]
+
+            # Build historical series
+            hist_series = work_df[value_col].reset_index(drop=True)
+            # Time index
+            if time_col in work_df.columns:
+                time_series = pd.Series(work_df[time_col]).reset_index(drop=True)
+            else:
+                time_series = pd.Series(range(len(hist_series)))
+
+            unified = pd.DataFrame({
+                time_col if time_col else 'index': time_series,
+                f'Historical {value_col}': hist_series
+            })
+            time_key = time_col if time_col else 'index'
+
+            descriptive_cols = [f'Historical {value_col}']
+            predictive_cols = []
+            prescriptive_cols = []
+
+            # Append forecast series if available
+            if forecast_results and 'forecasts' in forecast_results and isinstance(forecast_results['forecasts'], list):
+                forecasts = forecast_results['forecasts']
+                # Build extended time index
+                hist_len = len(unified)
+                future_index = np.arange(hist_len, hist_len + len(forecasts))
+                future_time = future_index
+                if pd.api.types.is_datetime64_any_dtype(time_series):
+                    # Assume uniform frequency of 1 period
+                    last = pd.to_datetime(time_series.iloc[-1])
+                    future_time = [last + pd.Timedelta(days=i+1) for i in range(len(forecasts))]
+                elif time_key == 'month_name':
+                    # Increment months cyclically as labels
+                    last_month = time_series.iloc[-1]
+                    try:
+                        last_idx = list(calendar.month_name).index(str(last_month))
+                    except ValueError:
+                        last_idx = 1
+                    future_time = [calendar.month_name[((last_idx + i - 1) % 12) + 1] for i in range(1, len(forecasts) + 1)]
+
+                forecast_df = pd.DataFrame({
+                    time_key: future_time,
+                    'Forecast': forecasts
+                })
+                unified = pd.concat([unified, forecast_df], ignore_index=True)
+                predictive_cols.append('Forecast')
+
+            # Add scenarios if available
+            if simulation_results and 'scenarios' in simulation_results and isinstance(simulation_results['scenarios'], list):
+                scenarios = simulation_results['scenarios']
+                # Base line for adjustment: use Forecast if available, else extend historical last value
+                base_series = None
+                if 'Forecast' in unified.columns:
+                    base_series = unified['Forecast'].dropna().reset_index(drop=True)
+                else:
+                    base_val = unified[descriptive_cols[0]].dropna().iloc[-1] if len(unified[descriptive_cols[0]].dropna()) > 0 else 0
+                    base_series = pd.Series([base_val] * 12)
+
+                for i, sc in enumerate(scenarios[:5]):
+                    name = sc.get('name', f'Scenario {i+1}')
+                    line_name = f'Scenario: {name}'
+                    if 'values' in sc and isinstance(sc['values'], list) and len(sc['values']) > 0:
+                        values = sc['values']
+                        # Align with tail of unified (forecast horizon)
+                        scenario_len = len(values)
+                        # Ensure rows exist
+                        needed_rows = scenario_len - (len(unified) - len(hist_series))
+                        if needed_rows > 0:
+                            # pad time forward as numeric index
+                            add_time = list(range(len(unified), len(unified) + needed_rows))
+                            pad_df = pd.DataFrame({time_key: add_time})
+                            unified = pd.concat([unified, pad_df], ignore_index=True)
+                        # Place values at the end
+                        start_idx = len(unified) - scenario_len
+                        scenario_series = pd.Series([np.nan] * len(unified))
+                        scenario_series.iloc[start_idx:] = values
+                        unified[line_name] = scenario_series
+                    else:
+                        # Use change_percent to scale base_series
+                        change_pct = sc.get('change_percent')
+                        try:
+                            if change_pct is None and 'parameters' in sc:
+                                # Try percentage string like "10%" in parameters values
+                                for v in sc['parameters'].values():
+                                    if isinstance(v, str) and v.endswith('%'):
+                                        change_pct = float(v.replace('%', ''))
+                                        break
+                            change_pct = float(change_pct) if change_pct is not None else 0.0
+                        except Exception:
+                            change_pct = 0.0
+                        scenario_vals = base_series * (1 + change_pct / 100.0)
+                        # Append or align to the tail of unified
+                        scenario_series = pd.Series([np.nan] * len(unified))
+                        tail_len = len(scenario_vals)
+                        if tail_len > len(unified) - len(hist_series):
+                            needed_rows = tail_len - (len(unified) - len(hist_series))
+                            add_time = list(range(len(unified), len(unified) + needed_rows))
+                            pad_df = pd.DataFrame({time_key: add_time})
+                            unified = pd.concat([unified, pad_df], ignore_index=True)
+                            scenario_series = pd.Series([np.nan] * len(unified))
+                        start_idx = len(unified) - tail_len
+                        scenario_series.iloc[start_idx:] = scenario_vals.values
+                        unified[line_name] = scenario_series
+                    prescriptive_cols.append(line_name)
+
+            return {
+                'dataframe': unified,
+                'time_column': time_key,
+                'descriptive_columns': descriptive_cols,
+                'predictive_columns': predictive_cols,
+                'prescriptive_columns': prescriptive_cols
+            }
+        except Exception as e:
+            logger.error(f"Error preparing unified analysis data: {e}")
+            # Fall back to simple plot using original df
+            return {
+                'dataframe': df,
+                'time_column': chart_config.get('x_axis') if chart_config else (df.columns[0] if len(df.columns) else None),
+                'descriptive_columns': [chart_config.get('y_axis')] if chart_config and chart_config.get('y_axis') in df.columns else [],
+                'predictive_columns': [],
+                'prescriptive_columns': []
+            }
     
     def _create_bar_chart(self, df: pd.DataFrame, x_col: str, y_col: str, title: str):
         if x_col and y_col and x_col in df.columns and y_col in df.columns:
@@ -1462,188 +1674,9 @@ class VisualizationAgent:
     
     def _create_continuous_analysis_chart(self, df: pd.DataFrame, x_col: str, y_col: str, title: str, 
                                         forecast_results: Dict[str, Any] = None, simulation_results: Dict[str, Any] = None):
-        """Create continuous line chart showing descriptive → predictive → prescriptive analysis"""
-        try:
-            # Check if DataFrame contains forecast/simulation columns
-            has_forecast_col = any('forecast' in col.lower() for col in df.columns)
-            has_simulation_col = any('simulat' in col.lower() or 'scenario' in col.lower() for col in df.columns)
-            
-            # Extract axis values
-            if x_col and x_col in df.columns:
-                x_values = df[x_col].values
-            else:
-                x_values = np.arange(len(df))
-            
-            # Sort by x-axis to ensure proper line progression
-            if len(x_values) > 1:
-                sorted_indices = np.argsort(x_values)
-                x_values = x_values[sorted_indices]
-                df_sorted = df.iloc[sorted_indices]
-            else:
-                df_sorted = df
-            
-            plt.figure(figsize=(16, 8))
-            
-            # Plot historical data (descriptive analysis)
-            if y_col and y_col in df.columns:
-                historical_values = df_sorted[y_col].values
-                plt.plot(x_values, historical_values, 'o-', linewidth=3, markersize=7, 
-                        color='#2E86C1', label='Historical Data', alpha=0.9, zorder=3)
-            
-            # Handle forecasted data from DataFrame columns or forecast_results
-            forecast_x = []
-            forecast_y = []
-            
-            # First check if forecast data is in DataFrame columns
-            if has_forecast_col:
-                for col in df.columns:
-                    if 'forecast' in col.lower():
-                        forecast_col_data = df_sorted[col].dropna().values
-                        if len(forecast_col_data) > 0:
-                            # Use same x-axis positions but extend for forecast
-                            forecast_x = x_values[:len(forecast_col_data)]
-                            forecast_y = forecast_col_data
-                            
-                            # Find connection point between historical and forecast
-                            if y_col and y_col in df.columns:
-                                historical_data = df_sorted[y_col].values
-                                # Connect last historical point to first forecast point
-                                connection_x = [x_values[len(historical_data)-1], forecast_x[0]]
-                                connection_y = [historical_data[-1], forecast_y[0]]
-                                plt.plot(connection_x, connection_y, '--', linewidth=2, 
-                                        color='#E74C3C', alpha=0.6)
-                            
-                            plt.plot(forecast_x, forecast_y, '--', linewidth=3, marker='s', markersize=6,
-                                    color='#E74C3C', label='Forecasted Data', alpha=0.8, zorder=2)
-                        break
-            
-            # If not in DataFrame, use forecast_results
-            elif forecast_results and "forecasts" in forecast_results:
-                forecasts = forecast_results["forecasts"]
-                if forecasts and y_col and y_col in df.columns:
-                    historical_values = df_sorted[y_col].values
-                    last_x = x_values[-1] if len(x_values) > 0 else 0
-                    
-                    # Generate x-axis values for forecast
-                    if len(x_values) > 1:
-                        x_step = x_values[-1] - x_values[-2] if len(x_values) > 1 else 1
-                    else:
-                        x_step = 1
-                    
-                    forecast_x = [last_x + (i + 1) * x_step for i in range(len(forecasts))]
-                    forecast_y = forecasts
-                    
-                    # Connect historical to forecast
-                    combined_x = np.concatenate([[x_values[-1]], forecast_x])
-                    combined_y = np.concatenate([[historical_values[-1]], forecast_y])
-                    
-                    plt.plot(combined_x, combined_y, '--', linewidth=3, marker='s', markersize=6,
-                            color='#E74C3C', label='Forecasted Data', alpha=0.8, zorder=2)
-                    
-                    # Add confidence intervals if available
-                    if "confidence_lower" in forecast_results and "confidence_upper" in forecast_results:
-                        conf_lower = forecast_results["confidence_lower"]
-                        conf_upper = forecast_results["confidence_upper"]
-                        plt.fill_between(forecast_x, conf_lower, conf_upper, 
-                                       alpha=0.2, color='#E74C3C', label='Forecast Confidence')
-            
-            # Handle simulation data from DataFrame columns or simulation_results
-            if has_simulation_col:
-                colors = ['#F39C12', '#8E44AD', '#27AE60', '#E67E22', '#34495E']
-                color_idx = 0
-                
-                for col in df.columns:
-                    if 'simulat' in col.lower() or 'scenario' in col.lower():
-                        sim_col_data = df_sorted[col].dropna().values
-                        if len(sim_col_data) > 0:
-                            sim_x = x_values[:len(sim_col_data)]
-                            
-                            # Connect to last forecast point or historical point
-                            if forecast_x and len(forecast_x) > 0:
-                                connection_x = [forecast_x[-1], sim_x[0]]
-                                connection_y = [forecast_y[-1], sim_col_data[0]]
-                            elif y_col and y_col in df.columns:
-                                historical_values = df_sorted[y_col].values
-                                connection_x = [x_values[-1], sim_x[0]]
-                                connection_y = [historical_values[-1], sim_col_data[0]]
-                            else:
-                                connection_x, connection_y = [], []
-                            
-                            if connection_x:
-                                plt.plot(connection_x, connection_y, ':', linewidth=2, 
-                                        color=colors[color_idx % len(colors)], alpha=0.6)
-                            
-                            plt.plot(sim_x, sim_col_data, ':', linewidth=3, marker='^', markersize=6,
-                                    color=colors[color_idx % len(colors)], 
-                                    label=f'Scenario: {col}', alpha=0.8, zorder=1)
-                            color_idx += 1
-            
-            # If not in DataFrame, use simulation_results
-            elif simulation_results and "scenarios" in simulation_results:
-                scenarios = simulation_results["scenarios"]
-                colors = ['#F39C12', '#8E44AD', '#27AE60', '#E67E22', '#34495E']
-                
-                for i, scenario in enumerate(scenarios[:5]):
-                    if "result" in scenario:
-                        scenario_value = scenario["result"]
-                        scenario_name = scenario.get("name", f"Scenario {i+1}")
-                        
-                        # Determine connection point
-                        if forecast_x and len(forecast_x) > 0:
-                            start_x = forecast_x[-1]
-                            start_y = forecast_y[-1]
-                            x_step = forecast_x[-1] - forecast_x[-2] if len(forecast_x) > 1 else 1
-                        elif y_col and y_col in df.columns:
-                            historical_values = df_sorted[y_col].values
-                            start_x = x_values[-1]
-                            start_y = historical_values[-1]
-                            x_step = x_values[-1] - x_values[-2] if len(x_values) > 1 else 1
-                        else:
-                            continue
-                        
-                        sim_x = [start_x, start_x + x_step]
-                        sim_y = [start_y, scenario_value]
-                        
-                        plt.plot(sim_x, sim_y, ':', linewidth=3, marker='^', markersize=6,
-                                color=colors[i % len(colors)], label=f'{scenario_name}', 
-                                alpha=0.8, zorder=1)
-            
-            # Enhance the chart appearance
-            plt.title(f'{title}\nContinuous Analysis: Historical → Forecast → Scenarios', 
-                     fontsize=16, fontweight='bold', pad=20)
-            plt.xlabel(x_col if x_col else 'Time/Sequence', fontsize=14)
-            plt.ylabel(y_col if y_col else 'Values', fontsize=14)
-            
-            # Improved legend positioning
-            plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=11)
-            plt.grid(True, alpha=0.3, linestyle='-', linewidth=0.5)
-            
-            # Add phase separators and annotations
-            y_min, y_max = plt.ylim()
-            y_range = y_max - y_min
-            
-            # Historical-Forecast separator
-            if forecast_x or has_forecast_col:
-                sep_x = x_values[-1] if len(x_values) > 0 else 0
-                plt.axvline(x=sep_x, color='gray', linestyle='--', alpha=0.6, linewidth=1.5)
-                plt.text(sep_x, y_max - 0.05 * y_range, 'Forecast Begin', 
-                        rotation=90, verticalalignment='top', fontsize=10, alpha=0.8,
-                        bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.7))
-            
-            # Forecast-Simulation separator
-            if (forecast_x and (has_simulation_col or (simulation_results and "scenarios" in simulation_results))):
-                sep_x = forecast_x[-1] if forecast_x else x_values[-1]
-                plt.axvline(x=sep_x, color='gray', linestyle=':', alpha=0.6, linewidth=1.5)
-                plt.text(sep_x, y_max - 0.15 * y_range, 'Scenarios', 
-                        rotation=90, verticalalignment='top', fontsize=10, alpha=0.8,
-                        bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.7))
-            
-            plt.tight_layout()
-            
-        except Exception as e:
-            logger.error(f"Error creating continuous analysis chart: {e}")
-            # Fallback to simple line chart
-            self._create_line_chart(df, x_col, y_col, title)
+        """Deprecated: Prefer unified multi-line chart. Kept for backward compatibility."""
+        return self._create_line_chart(df, x_col, y_col, title)
+        
 
 # Predictive Analysis Agent
 class PredictiveAnalysisAgent:
@@ -1667,6 +1700,16 @@ class PredictiveAnalysisAgent:
         }
         
         try:
+            # Heuristic: extract explicit forecast horizon from user_input (e.g., "next 3 months")
+            horizon = None
+            try:
+                import re
+                m = re.search(r"next\s+(\d{1,3})\s*(month|months|m)\b", user_input, re.IGNORECASE)
+                if m:
+                    horizon = int(m.group(1))
+            except Exception:
+                horizon = None
+
             prompt = self.predictive_prompt.format(
                 user_input=user_input,
                 query_data=str(query_data[:10]),  # First 10 rows for analysis
@@ -1688,7 +1731,11 @@ class PredictiveAnalysisAgent:
             
             # Validate and set defaults
             config.setdefault("model_type", fallback_config["model_type"])
-            config.setdefault("forecast_periods", fallback_config["forecast_periods"])
+            # Override with horizon from user_input when present
+            if horizon is not None:
+                config["forecast_periods"] = horizon
+            else:
+                config.setdefault("forecast_periods", fallback_config["forecast_periods"]) 
             config.setdefault("confidence_level", fallback_config["confidence_level"])
             
             return config
@@ -1869,6 +1916,20 @@ class PrescriptiveAnalysisAgent:
         }
         
         try:
+            # Heuristic: extract percentage from user_input (e.g., "simulate 10%", "+10%", "increase 10%")
+            percent = None
+            try:
+                import re
+                m = re.search(r"(simulate|increase|decrease|change|\+|-)\s*(\d{1,3})\s*%", user_input, re.IGNORECASE)
+                if m:
+                    sign = m.group(1)
+                    val = int(m.group(2))
+                    if sign.strip().lower() == 'decrease' or sign.strip() == '-':
+                        val = -val
+                    percent = val
+            except Exception:
+                percent = None
+
             prompt = self.prescriptive_prompt.format(
                 user_input=user_input,
                 query_data=str(query_data[:10]),  # First 10 rows for analysis
@@ -1890,9 +1951,28 @@ class PrescriptiveAnalysisAgent:
             
             # Validate and set defaults
             config.setdefault("simulation_type", fallback_config["simulation_type"])
-            config.setdefault("independent_variables", fallback_config["independent_variables"])
-            config.setdefault("dependent_variable", fallback_config["dependent_variable"])
-            config.setdefault("scenarios", fallback_config["scenarios"])
+            # Prefer a sensible dependent variable name
+            dv = config.get("dependent_variable")
+            if not dv:
+                # pick first column that looks like a total/count/amount, else first column
+                candidates = [c for c in columns if any(k in c.lower() for k in ["total", "count", "amount", "revenue", "value"]) ]
+                dv = candidates[0] if candidates else columns[0]
+                config["dependent_variable"] = dv
+
+            config.setdefault("independent_variables", fallback_config["independent_variables"])            
+            config.setdefault("scenarios", fallback_config["scenarios"])            
+
+            # If a percent was requested in prompt, ensure a scenario exists for it
+            if percent is not None:
+                label = f"{percent:+d}% Simulation"
+                scenario = {
+                    "name": label,
+                    "parameters": {},
+                    "change_percent": percent,
+                    "description": f"Apply a {percent:+d}% change to {dv}"
+                }
+                # Prepend the scenario so it appears prominently
+                config["scenarios"] = [scenario] + config.get("scenarios", [])
             
             return config
             
@@ -1947,20 +2027,29 @@ class PrescriptiveAnalysisAgent:
             for scenario in scenarios:
                 scenario_name = scenario.get("name", "Scenario")
                 parameters = scenario.get("parameters", {})
+                change_percent = scenario.get("change_percent")
                 
                 # Create modified dataset
                 modified_df = df.copy()
-                for param, value in parameters.items():
-                    if param in modified_df.columns:
-                        # Apply percentage change if value is string with %
-                        if isinstance(value, str) and '%' in value:
-                            percent_change = float(value.replace('%', '')) / 100
-                            modified_df[param] = modified_df[param] * (1 + percent_change)
-                        else:
-                            try:
-                                modified_df[param] = float(value)
-                            except:
-                                pass  # Skip if cannot convert
+                # If explicit column parameters were given, apply them
+                if parameters:
+                    for param, value in parameters.items():
+                        if param in modified_df.columns:
+                            if isinstance(value, str) and '%' in value:
+                                percent_change = float(value.replace('%', '')) / 100
+                                modified_df[param] = modified_df[param] * (1 + percent_change)
+                            else:
+                                try:
+                                    modified_df[param] = float(value)
+                                except Exception:
+                                    pass
+                # Otherwise, if a change_percent is given, apply it directly to dependent variable series for per-period values
+                elif change_percent is not None and dependent_var in modified_df.columns:
+                    try:
+                        pct = float(change_percent)
+                    except Exception:
+                        pct = 0.0
+                    modified_df[dependent_var] = modified_df[dependent_var] * (1 + pct / 100.0)
                 
                 # Calculate impact on dependent variable
                 if dependent_var and dependent_var in modified_df.columns:
@@ -1968,14 +2057,18 @@ class PrescriptiveAnalysisAgent:
                     change = new_value - baseline_value
                     change_percent = (change / baseline_value * 100) if baseline_value != 0 else 0
                     
-                    results["scenarios"].append({
+                    scenario_entry = {
                         "name": scenario_name,
                         "parameters": parameters,
                         "result": new_value,
                         "change": change,
                         "change_percent": change_percent,
                         "description": scenario.get("description", "")
-                    })
+                    }
+                    # Provide per-period values for plotting a line if we changed the dependent series
+                    if dependent_var in modified_df.columns:
+                        scenario_entry["values"] = modified_df[dependent_var].tolist()
+                    results["scenarios"].append(scenario_entry)
             
             return results
             
@@ -2457,7 +2550,14 @@ class SQLAgent:
                     validation_result
                 )
                 state["visualization_result"] = viz_base64
-                state["chart_type"] = chart_config.get("chart_type", "bar")
+                # If predictive/prescriptive data exists, this is a unified multi-line line chart
+                if (
+                    (state.get("forecast_results") and not state["forecast_results"].get("error"))
+                    or (state.get("simulation_results") and not state["simulation_results"].get("error"))
+                ):
+                    state["chart_type"] = "line"
+                else:
+                    state["chart_type"] = chart_config.get("chart_type", "bar")
                 state["visualization_data"] = chart_config
                 
                 # Add chart recommendations to response
