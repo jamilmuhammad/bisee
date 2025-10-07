@@ -15,6 +15,7 @@ import streamlit as st
 from pydantic import BaseModel
 
 import groq
+import contextlib
 from langchain.schema import BaseMessage, HumanMessage, AIMessage
 from langchain.prompts import PromptTemplate
 from langchain_groq import ChatGroq
@@ -76,6 +77,42 @@ class Config:
     POSTGRES_URL: Optional[str] = os.getenv("POSTGRES_URL")
     DATABASE_NAME = os.getenv("DATABASE_NAME", "rag_chatbot")
     GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+    LANGSMITH_API_KEY = os.getenv("LANGSMITH_API_KEY")
+    LANGSMITH_PROJECT = os.getenv("LANGSMITH_PROJECT", "bisee-rag-chatbot")
+    LANGSMITH_ENDPOINT = os.getenv("LANGSMITH_ENDPOINT", "https://api.smith.langchain.com")
+    POSTGRES_CONNECT_TIMEOUT = int(os.getenv("POSTGRES_CONNECT_TIMEOUT", "5"))
+
+# LangSmith Setup - Proper Environment Variable Configuration
+if Config.LANGSMITH_API_KEY:
+    os.environ["LANGCHAIN_TRACING_V2"] = "true"
+    os.environ["LANGCHAIN_ENDPOINT"] = Config.LANGSMITH_ENDPOINT
+    os.environ["LANGCHAIN_API_KEY"] = Config.LANGSMITH_API_KEY
+    os.environ["LANGCHAIN_PROJECT"] = Config.LANGSMITH_PROJECT
+    logger.info(f"LangSmith tracing enabled for project: {Config.LANGSMITH_PROJECT}")
+else:
+    logger.warning("LangSmith API key not found. Tracing disabled.")
+
+# Optional: Import langsmith for custom tracking
+try:
+    from langsmith import Client
+    from langsmith.run_helpers import traceable
+    
+    langsmith_client = Client(
+        api_key=Config.LANGSMITH_API_KEY,
+        api_url=Config.LANGSMITH_ENDPOINT
+    ) if Config.LANGSMITH_API_KEY else None
+    
+    LANGSMITH_AVAILABLE = True
+except ImportError:
+    logger.warning("langsmith package not installed. Install with: pip install langsmith")
+    langsmith_client = None
+    LANGSMITH_AVAILABLE = False
+    
+    # Create dummy decorator if langsmith not available
+    def traceable(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
 
 # Pydantic models for structured responses
 class ChatRequest(BaseModel):
@@ -111,6 +148,7 @@ class DatabaseManager:
             raise ValueError("PostgreSQL URL is not configured.")
         return psycopg2.connect(Config.POSTGRES_URL, cursor_factory=RealDictCursor)
     
+    @traceable(name="save_session")
     def save_session(self, session_id: str, message: str, response: str, query_type: str):
         session_data = {
             "session_id": session_id,
@@ -121,6 +159,7 @@ class DatabaseManager:
         }
         self.sessions_collection.insert_one(session_data)
     
+    @traceable(name="get_session_context")
     def get_session_context(self, session_id: str, limit: int = 5) -> List[Dict]:
         return list(self.sessions_collection.find(
             {"session_id": session_id}
@@ -131,6 +170,7 @@ class QueryExecutor:
     def __init__(self, db_manager: DatabaseManager):
         self.db_manager = db_manager
     
+    @traceable(name="execute_query")
     def execute_query(self, query: str) -> Dict[str, Any]:
         try:
             with self.db_manager.get_postgres_connection() as conn:
@@ -161,6 +201,7 @@ class SchemaInspector:
         self.db_manager = db_manager
         self._schema_cache = None
     
+    @traceable(name="get_schema_info")
     @st.cache_data(ttl=600)
     def get_schema_info(_self) -> Dict[str, Any]:
         if _self._schema_cache:
@@ -2246,6 +2287,7 @@ class SQLAgent:
         
         return workflow.compile()
     
+    @traceable(name="route_query")
     def route_query(self, state: AgentState) -> AgentState:
         """Route the query to appropriate handler"""
         user_input = state["user_input"]
@@ -2334,6 +2376,7 @@ class SQLAgent:
         state["context"] = context
         return state
     
+    @traceable(name="route_decision")
     def route_decision(self, state: AgentState) -> str:
         """Decide the route based on query types"""
         query_types = state["query_types"]
@@ -2350,6 +2393,7 @@ class SQLAgent:
         else:
             return "general"
     
+    @traceable(name="generate_sql")
     def generate_sql(self, state: AgentState) -> AgentState:
         """Generate SQL query"""
         sql_query = self.query_generator.generate_query(
@@ -2360,6 +2404,7 @@ class SQLAgent:
         state["generated_sql"] = sql_query
         return state
     
+    @traceable(name="execute_sql")
     def execute_sql(self, state: AgentState) -> AgentState:
         """Execute SQL query"""
         if state["sql_query"] == "UNSUPPORTED_QUERY":
@@ -2380,6 +2425,7 @@ class SQLAgent:
         state["data_query_result"] = state["query_results"]
         return state
     
+    @traceable(name="validate_data")
     def validate_data(self, state: AgentState) -> AgentState:
         """Validate data quality and suitability for visualization"""
         if state["query_results"]["success"] and "visualization" in state["query_types"]:
@@ -2406,6 +2452,7 @@ class SQLAgent:
         
         return state
     
+    @traceable(name="check_query_improvement_needed")
     def check_query_improvement_needed(self, state: AgentState) -> str:
         """Check if query needs improvement based on validation"""
         validation_result = state.get("data_validation")
@@ -2423,6 +2470,7 @@ class SQLAgent:
         
         return "continue"
     
+    @traceable(name="improve_query")
     def improve_query(self, state: AgentState) -> AgentState:
         """Improve SQL query based on validation feedback"""
         validation_result = state.get("data_validation")
@@ -2446,6 +2494,7 @@ class SQLAgent:
         
         return state
     
+    @traceable(name="format_sql_response")
     def format_sql_response(self, state: AgentState) -> AgentState:
         """Format the SQL response"""
         results = state["query_results"]
@@ -2461,6 +2510,7 @@ class SQLAgent:
         state["final_response"] = response
         return state
     
+    @traceable(name="reflect_response")
     def reflect_response(self, state: AgentState) -> AgentState:
         """Reflect on the response quality"""
         if state["query_results"]["success"]:
@@ -2475,6 +2525,7 @@ class SQLAgent:
             state["reflection_feedback"] = "APPROVED"
         return state
     
+    @traceable(name="refine_response")
     def refine_response(self, state: AgentState) -> AgentState:
         """Refine the response based on reflection"""
         if state["reflection_feedback"] != "APPROVED":
@@ -2491,6 +2542,7 @@ class SQLAgent:
             state["refined_response"] = state["final_response"]
         return state
     
+    @traceable(name="check_analysis_needed")
     def check_analysis_needed(self, state: AgentState) -> str:
         """Check what type of analysis is needed"""
         query_types = state["query_types"]
@@ -2505,6 +2557,7 @@ class SQLAgent:
         else:
             return "complete"
     
+    @traceable(name="check_next_analysis")
     def check_next_analysis(self, state: AgentState) -> str:
         """Check what analysis type should run next in sequence"""
         query_types = state["query_types"]
@@ -2521,6 +2574,7 @@ class SQLAgent:
         else:
             return "complete"
     
+    @traceable(name="generate_visualization")
     def generate_visualization(self, state: AgentState) -> AgentState:
         """Generate visualization"""
         if state["query_results"]["success"] and state["query_results"]["data"]:
@@ -2572,6 +2626,7 @@ class SQLAgent:
         
         return state
     
+    @traceable(name="generate_predictive")
     def generate_predictive(self, state: AgentState) -> AgentState:
         """Generate predictive analysis"""
         if state["query_results"]["success"] and state["query_results"]["data"]:
@@ -2621,6 +2676,7 @@ class SQLAgent:
         
         return state
     
+    @traceable(name="generate_prescriptive")
     def generate_prescriptive(self, state: AgentState) -> AgentState:
         """Generate prescriptive analysis"""
         if state["query_results"]["success"] and state["query_results"]["data"]:
@@ -2681,6 +2737,7 @@ class SQLAgent:
         
         return state
 
+    @traceable(name="handle_general")
     def handle_general(self, state: AgentState) -> AgentState:
         """Handle general queries"""
         available_tables = list(self.schema_inspector.get_schema_info().keys())
@@ -2695,6 +2752,7 @@ class SQLAgent:
         state["final_response"] = response.content.strip()
         return state
     
+    @traceable(name="finalize_response")
     def finalize_response(self, state: AgentState) -> AgentState:
         """Finalize the response with markdown formatting"""
         state["markdown_result"] = self._format_markdown_response(state)
@@ -2751,6 +2809,7 @@ class SQLAgent:
         
         return "\n".join(markdown_parts)
     
+    @traceable(name="bisee-rag-agent")
     def process_message(self, message: str, session_id: Optional[str] = None) -> Dict[str, Any]:
         """Process a message and return structured response"""
         if not session_id:
@@ -2794,13 +2853,13 @@ class SQLAgent:
             final_state["final_response"],
             query_type_str
         )
-        
-        # Return structured response
-        return {
+
+        result = {
             "response": final_state["final_response"],
             "session_id": session_id,
             "query_types": final_state["query_types"],  # Return as array
             "query_type": query_type_str,  # Keep for backward compatibility
+            "user_input": message,
             "generated_sql": final_state.get("generated_sql"),
             "data_query_result": final_state.get("data_query_result"),
             "markdown_result": final_state.get("markdown_result"),
@@ -2812,6 +2871,8 @@ class SQLAgent:
             "predictive_model": final_state.get("predictive_model"),
             "simulation_parameters": final_state.get("simulation_parameters")
         }
+
+        return result
 
 def show_db_config_form():
     st.header("Configure Database Connection")
