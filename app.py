@@ -518,6 +518,10 @@ STRICT RULES:
 - No complex subqueries or CTEs unless absolutely necessary
 - No user-defined functions or stored procedures
 
+INTERPRETATION GUIDELINES:
+- For **prescriptive** queries asking to 'simulate' or 'project' a percentage (e.g., 'simulate 10%'), interpret this as calculating the original value **plus** that percentage. For a 10% simulation, calculate `original_value * 1.1`.
+**- For predictive queries asking to 'forecast' or 'predict' future values (e.g., 'forecast sales for the next 6 months'), your role is to write a SQL query that retrieves the necessary historical data. The query should select the relevant time period (e.g., month, year) and the metric to be forecasted. Ensure the results are ordered chronologically to create a clean time series.**
+
 Database Schema:
 {schema_info}
 
@@ -983,6 +987,46 @@ class VisualizationAgent:
     def __init__(self, llm: ChatGroq):
         self.llm = llm
         self.viz_prompt = PromptTemplates.get_visualization_prompt()
+
+    def _has_multiple_analysis_columns(self, df: pd.DataFrame) -> bool:
+        """
+        Checks if the DataFrame contains columns from different analysis types
+        (e.g., a base metric plus a 'forecast' or 'scenario' column).
+        """
+        analysis_keywords = {
+            'predictive': ['forecast', 'predict', 'yhat'],
+            'prescriptive': ['scenario', 'simulate', 'what if']
+        }
+        
+        found_types = set()
+        
+        # Consider only numeric columns for analysis
+        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        if not numeric_cols:
+            return False
+
+        has_base_metric = False
+
+        for col in numeric_cols:
+            col_lower = col.lower()
+            is_analysis_col = False
+            
+            # Check for predictive keywords
+            if any(key in col_lower for key in analysis_keywords['predictive']):
+                found_types.add('predictive')
+                is_analysis_col = True
+                
+            # Check for prescriptive keywords
+            if any(key in col_lower for key in analysis_keywords['prescriptive']):
+                found_types.add('prescriptive')
+                is_analysis_col = True
+
+            if not is_analysis_col:
+                has_base_metric = True
+
+        # Return true if we have a base metric AND at least one analysis type,
+        # OR if we have multiple different analysis types (e.g., forecast + scenario).
+        return (has_base_metric and len(found_types) > 0) or (len(found_types) > 1)
         
     def generate_chart_config(self, user_input: str, query_results: Dict[str, Any], validation_result: Dict[str, Any] = None) -> Dict[str, Any]:
         """Generate chart configuration based on query results and validation"""
@@ -991,8 +1035,9 @@ class VisualizationAgent:
         
         data = query_results["data"]
         columns = query_results["columns"]
-        logger.info(data, "Query results data")
-        logger.info(columns, "Query results columns")
+    
+        logger.info(f"Query results data: {data}")
+        logger.info(f"Query results columns: {columns}")
         
         # Use validation results if available
         if validation_result and validation_result.get("axis_mapping"):
@@ -2057,6 +2102,8 @@ class PrescriptiveAnalysisAgent:
             
             # Calculate baseline
             if dependent_var and dependent_var in df.columns:
+                df[dependent_var] = pd.to_numeric(df[dependent_var], errors='coerce')
+                
                 baseline_value = df[dependent_var].mean()
                 results["baseline"] = {
                     "scenario": "Current State",
