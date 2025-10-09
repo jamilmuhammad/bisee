@@ -41,6 +41,8 @@ warnings.filterwarnings('ignore')
 
 import calendar
 
+import requests
+
 # Time series forecasting imports
 try:
     from statsmodels.tsa.arima.model import ARIMA
@@ -2949,6 +2951,13 @@ def show_db_config_form():
 
 def show_chat_interface():
     st.title("Advanced Analytics SQL Agent - Descriptive, Predictive & Prescriptive Analysis")
+
+    # This code will fetch and display the app's public IP address
+    try:
+        ip = requests.get('https://api.ipify.org').text
+        st.info(f"The public IP address of this Streamlit app is: **{ip}**")
+    except Exception as e:
+        st.error(f"Could not get IP address. Error: {e}")
 
     if "messages" not in st.session_state:
         st.session_state.messages = []
