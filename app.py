@@ -72,22 +72,22 @@ load_dotenv()
 
 # Configuration
 class Config:
-    GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-    MONGODB_URL = os.getenv("MONGODB_URL", "mongodb://localhost:27017")
-    POSTGRES_URL: Optional[str] = os.getenv("POSTGRES_URL")
-    DATABASE_NAME = os.getenv("DATABASE_NAME", "rag_chatbot")
-    GROQ_MODEL = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
-    LANGSMITH_API_KEY = os.getenv("LANGSMITH_API_KEY")
-    LANGSMITH_PROJECT = os.getenv("LANGSMITH_PROJECT", "bisee-rag-chatbot")
-    LANGSMITH_ENDPOINT = os.getenv("LANGSMITH_ENDPOINT", "https://api.smith.langchain.com")
-    POSTGRES_CONNECT_TIMEOUT = int(os.getenv("POSTGRES_CONNECT_TIMEOUT", "5"))
+    GROQ_API_KEY = st.secrets.get("GROQ_API_KEY") or os.getenv("GROQ_API_KEY")
+    MONGODB_URL = st.secrets.get("MONGODB_URL") or os.getenv("MONGODB_URL", "mongodb://localhost:27017")
+    POSTGRES_URL = st.secrets.get("POSTGRES_URL") or os.getenv("POSTGRES_URL")
+    DATABASE_NAME = st.secrets.get("DATABASE_NAME") or os.getenv("DATABASE_NAME", "rag_chatbot")
+    GROQ_MODEL = st.secrets.get("GROQ_MODEL") or os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+    LANGSMITH_API_KEY = st.secrets.get("LANGSMITH_API_KEY") or os.getenv("LANGSMITH_API_KEY")
+    LANGSMITH_PROJECT = st.secrets.get("LANGSMITH_PROJECT") or os.getenv("LANGSMITH_PROJECT", "bisee-rag-chatbot")
+    LANGSMITH_ENDPOINT = st.secrets.get("LANGSMITH_ENDPOINT") or os.getenv("LANGSMITH_ENDPOINT", "https://api.smith.langchain.com")
+    POSTGRES_CONNECT_TIMEOUT = int(st.secrets.get("POSTGRES_CONNECT_TIMEOUT") or os.getenv("POSTGRES_CONNECT_TIMEOUT", "5"))
 
 # LangSmith Setup - Proper Environment Variable Configuration
 if Config.LANGSMITH_API_KEY:
-    os.environ["LANGCHAIN_TRACING_V2"] = "true"
-    os.environ["LANGCHAIN_ENDPOINT"] = Config.LANGSMITH_ENDPOINT
-    os.environ["LANGCHAIN_API_KEY"] = Config.LANGSMITH_API_KEY
-    os.environ["LANGCHAIN_PROJECT"] = Config.LANGSMITH_PROJECT
+    os.environ["LANGCHAIN_TRACING_V2"] = st.secrets.get("LANGCHAIN_TRACING_V2") or "true"
+    os.environ["LANGCHAIN_ENDPOINT"] = st.secrets.get("LANGCHAIN_ENDPOINT") or Config.LANGSMITH_ENDPOINT
+    os.environ["LANGCHAIN_API_KEY"] = st.secrets.get("LANGCHAIN_API_KEY") or Config.LANGSMITH_API_KEY
+    os.environ["LANGCHAIN_PROJECT"] = st.secrets.get("LANGCHAIN_PROJECT") or Config.LANGSMITH_PROJECT
     logger.info(f"LangSmith tracing enabled for project: {Config.LANGSMITH_PROJECT}")
 else:
     logger.warning("LangSmith API key not found. Tracing disabled.")
