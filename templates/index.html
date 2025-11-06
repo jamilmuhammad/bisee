@@ -1,0 +1,352 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>RAG Chatbot</title>
+    <script src="https://cdnjs.cloudflare.com/ajax/libs/marked/4.0.2/marked.min.js"></script>
+    <script src="https://cdn.tailwindcss.com"></script>
+    <script>
+        tailwind.config = {
+            darkMode: 'class',
+            theme: {
+                extend: {
+                    colors: {
+                        primary: '#4f46e5',
+                        secondary: '#6b7280',
+                        highlight: '#dbeafe'
+                    }
+                }
+            }
+        }
+    </script>
+</head>
+<body class="bg-gray-50 text-gray-900">
+    <div class="grid grid-cols-[250px_1fr] grid-rows-[60px_1fr] h-screen overflow-hidden">
+        <header class="col-span-2 bg-white border-b border-gray-200 flex justify-between items-center px-5 shadow-sm">
+            <div class="flex items-center font-semibold text-lg text-primary">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-6 w-6 mr-2" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M21 15a2 2 0 0 1-2 2H7l-4 4V5a2 2 0 0 1 2-2h14a2 2 0 0 1 2 2z"></path>
+                </svg>
+                RAG Chatbot
+            </div>
+            <button id="theme-toggle" class="p-2 rounded-lg hover:bg-gray-100">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-5 w-5" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <path d="M21 12.79A9 9 0 1 1 11.21 3 7 7 0 0 0 21 12.79z"></path>
+                </svg>
+            </button>
+        </header>
+        
+        <aside class="bg-white border-r border-gray-200 p-5 overflow-y-auto h-[calc(100vh-60px)]">
+            <button class="w-full flex items-center justify-center gap-2 bg-primary text-white rounded-lg py-2 px-4 mb-4 hover:bg-primary/90">
+                <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                    <line x1="12" y1="5" x2="12" y2="19"></line>
+                    <line x1="5" y1="12" x2="19" y2="12"></line>
+                </svg>
+                New Chat
+            </button>
+            
+            <div class="mb-6">
+                <h3 class="font-semibold mb-3">Chat History</h3>
+                <ul class="space-y-2">
+                    <li class="p-3 rounded-lg bg-highlight font-medium">Document Analysis - Project X</li>
+                    <li class="p-3 rounded-lg hover:bg-gray-100">Research Summary - AI Trends</li>
+                    <li class="p-3 rounded-lg hover:bg-gray-100">Customer Data Analysis</li>
+                </ul>
+            </div>
+            
+            <div>
+                <h3 class="font-semibold mb-3">Uploaded Documents</h3>
+                <label for="file-upload" class="flex items-center gap-2 p-3 bg-gray-50 border border-gray-200 rounded-lg cursor-pointer hover:bg-gray-100">
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <path d="M21 15v4a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2v-4"></path>
+                        <polyline points="17 8 12 3 7 8"></polyline>
+                        <line x1="12" y1="3" x2="12" y2="15"></line>
+                    </svg>
+                    Upload Documents
+                </label>
+                <input type="file" id="file-upload" class="hidden" multiple>
+                
+                <ul class="mt-3 space-y-2">
+                    <li class="flex items-center justify-between p-2 bg-gray-50 rounded">
+                        <span class="truncate max-w-[150px] text-sm">research_paper.pdf</span>
+                        <button class="p-1 text-gray-500 hover:text-red-500">
+                            <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                <line x1="18" y1="6" x2="6" y2="18"></line>
+                                <line x1="6" y1="6" x2="18" y2="18"></line>
+                            </svg>
+                        </button>
+                    </li>
+                    <li class="flex items-center justify-between p-2 bg-gray-50 rounded">
+                        <span class="truncate max-w-[150px] text-sm">dataset.csv</span>
+                        <button class="p-1 text-gray-500 hover:text-red-500">
+                            <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                                <line x1="18" y1="6" x2="6" y2="18"></line>
+                                <line x1="6" y1="6" x2="18" y2="18"></line>
+                            </svg>
+                        </button>
+                    </li>
+                </ul>
+            </div>
+        </aside>
+        
+        <main class="grid grid-cols-[1fr_300px] h-[calc(100vh-60px)] overflow-hidden">
+            <div class="flex flex-col border-r border-gray-200 h-full overflow-hidden">
+                <div class="flex-1 overflow-y-auto p-5 space-y-5" id="messages">
+                    <div class="flex">
+                        <div class="max-w-[80%] bg-white border border-gray-200 rounded-lg rounded-tl-none p-3">
+                            Hello! I'm your AI assistant powered by RAG. Upload relevant documents and I'll use them to provide better answers based on your content.
+                        </div>
+                    </div>
+                    <div class="flex justify-end">
+                        <div class="max-w-[80%] bg-primary text-white rounded-lg rounded-tr-none p-3">
+                            Can you analyze the research paper I just uploaded?
+                        </div>
+                    </div>
+                    <div class="flex">
+                        <div class="max-w-[80%] bg-white border border-gray-200 rounded-lg rounded-tl-none p-3">
+                            I've analyzed the research paper you uploaded. The key findings suggest that implementing RAG models can improve response accuracy by 37% compared to standard LLMs. The methodology section on pages 4-7 outlines their experimental setup using <span class="bg-highlight text-sm rounded px-2 py-1 cursor-pointer" data-source="research_paper.pdf" data-page="5">citation[1]</span> which tested various retrieval methods.
+                        </div>
+                    </div>
+                </div>
+                
+                <div class="border-t border-gray-200 p-4 bg-white flex items-center gap-2">
+                    <textarea id="user-input" class="flex-1 border border-gray-200 rounded-lg p-3 h-[42px] max-h-[120px] resize-none focus:border-primary focus:ring-1 focus:ring-primary focus:outline-none" placeholder="Type your message..."></textarea>
+                    <button id="send-button" class="flex items-center gap-1 bg-primary text-white rounded-lg px-4 py-2.5 hover:bg-primary/90">
+                        <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                            <line x1="22" y1="2" x2="11" y2="13"></line>
+                            <polygon points="22 2 15 22 11 13 2 9 22 2"></polygon>
+                        </svg>
+                        Send
+                    </button>
+                </div>
+            </div>
+            
+            <div class="flex flex-col h-full overflow-hidden">
+                <div class="flex border-b border-gray-200">
+                    <button class="px-4 py-3 font-medium border-b-2 border-primary text-primary" data-tab="summary">Document Summary</button>
+                    <button class="px-4 py-3 font-medium border-b-2 border-transparent hover:text-primary" data-tab="preview">Markdown Preview</button>
+                </div>
+                
+                <div class="p-5 overflow-y-auto flex-1" id="summary-tab">
+                    <div class="space-y-4">
+                        <h3 class="text-lg font-semibold">Research Paper Summary</h3>
+                        <p>Title: <strong>Improving Knowledge Retrieval in Large Language Models through RAG Implementation</strong></p>
+                        <p>Authors: Smith, J., Chen, L., Patel, R.</p>
+                        <p>Published: March 2025</p>
+                        
+                        <h4 class="font-semibold mt-6">Key Findings:</h4>
+                        <ul class="list-disc pl-5 space-y-1">
+                            <li>RAG implementation improved response accuracy by 37%</li>
+                            <li>Context window optimization reduced hallucination by 42%</li>
+                            <li>Hybrid retrieval methods outperformed BM25 and dense retrieval alone</li>
+                        </ul>
+                        
+                        <h4 class="font-semibold mt-6">Methodology:</h4>
+                        <p>The study used a combination of vector embeddings (using BERT-large) and semantic search to retrieve relevant passages. The embedding model was fine-tuned on domain-specific data before deployment.</p>
+                        
+                        <h4 class="font-semibold mt-6">Recommendations:</h4>
+                        <p>The authors suggest implementing chunking strategies with 60-70% overlap for optimal retrieval performance and using reranking models to improve the quality of retrieved passages.</p>
+                    </div>
+                </div>
+                
+                <div class="hidden p-5 overflow-y-auto flex-1" id="preview-tab">
+                    <textarea id="markdown-input" class="w-full border border-gray-200 rounded-lg p-3 mb-4" placeholder="Write markdown here to preview..." rows="8"></textarea>
+                    <div class="prose prose-sm max-w-none p-4 border border-gray-200 rounded-lg bg-white" id="markdown-output">
+                        <h2>Markdown Preview</h2>
+                        <p>Your formatted text will appear here as you type in the box above.</p>
+                        <p>Support for <strong>bold</strong>, <em>italic</em>, <code>code</code>, and more:</p>
+                        <pre><code>function example() {
+  console.log("This is a code block");
+}</code></pre>
+                        <ul>
+                            <li>Bulleted lists</li>
+                            <li>Like this one</li>
+                        </ul>
+                    </div>
+                </div>
+            </div>
+        </main>
+    </div>
+
+    <script>
+        // Toggle between light and dark theme
+        const themeToggle = document.getElementById('theme-toggle');
+        themeToggle.addEventListener('click', () => {
+            document.documentElement.classList.toggle('dark');
+        });
+        
+        // Handle tab switching
+        const tabs = document.querySelectorAll('[data-tab]');
+        tabs.forEach(tab => {
+            tab.addEventListener('click', () => {
+                tabs.forEach(t => {
+                    t.classList.remove('border-primary', 'text-primary');
+                    t.classList.add('border-transparent');
+                });
+                tab.classList.add('border-primary', 'text-primary');
+                tab.classList.remove('border-transparent');
+                
+                document.querySelectorAll('[id$="-tab"]').forEach(content => {
+                    content.classList.add('hidden');
+                });
+                
+                document.getElementById(`${tab.getAttribute('data-tab')}-tab`).classList.remove('hidden');
+            });
+        });
+        
+        // Auto-resize textarea
+        const textarea = document.getElementById('user-input');
+        textarea.addEventListener('input', function() {
+            this.style.height = 'auto';
+            this.style.height = (this.scrollHeight) + 'px';
+        });
+        
+        // Send message when pressing Enter (without Shift)
+        textarea.addEventListener('keydown', function(e) {
+            if (e.key === 'Enter' && !e.shiftKey) {
+                e.preventDefault();
+                document.getElementById('send-button').click();
+            }
+        });
+        
+        // Handle file upload
+        const fileInput = document.getElementById('file-upload');
+        const fileList = document.querySelector('.file-list');
+        
+        fileInput.addEventListener('change', () => {
+            Array.from(fileInput.files).forEach(file => {
+                const fileItem = document.createElement('li');
+                fileItem.className = 'flex items-center justify-between p-2 bg-gray-50 rounded';
+                
+                const fileName = document.createElement('span');
+                fileName.className = 'truncate max-w-[150px] text-sm';
+                fileName.textContent = file.name;
+                
+                const deleteButton = document.createElement('button');
+                deleteButton.className = 'p-1 text-gray-500 hover:text-red-500';
+                deleteButton.innerHTML = `
+                    <svg xmlns="http://www.w3.org/2000/svg" class="h-4 w-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+                        <line x1="18" y1="6" x2="6" y2="18"></line>
+                        <line x1="6" y1="6" x2="18" y2="18"></line>
+                    </svg>
+                `;
+                
+                deleteButton.addEventListener('click', () => {
+                    fileItem.remove();
+                });
+                
+                fileItem.appendChild(fileName);
+                fileItem.appendChild(deleteButton);
+                fileList.appendChild(fileItem);
+            });
+            
+            fileInput.value = '';
+        });
+        
+        // Delete existing file items
+        document.querySelectorAll('.delete-file').forEach(button => {
+            button.addEventListener('click', () => {
+                button.parentElement.remove();
+            });
+        });
+
+        async function sendMessage(message) {
+            if (message) {
+                const messagesContainer = document.getElementById('messages');
+                
+                // Add user message
+                const userMessageDiv = document.createElement('div');
+                userMessageDiv.className = 'flex justify-end';
+                userMessageDiv.innerHTML = `
+                    <div class="max-w-[80%] bg-primary text-white rounded-lg rounded-tr-none p-3">${message}</div>
+                `;
+                messagesContainer.appendChild(userMessageDiv);
+
+                // Clear input
+                textarea.value = '';
+                textarea.style.height = 'auto';
+
+                // Scroll to bottom
+                messagesContainer.scrollTop = messagesContainer.scrollHeight;
+
+                // Create loading message
+                const loadingDiv = document.createElement('div');
+                loadingDiv.className = 'flex';
+                loadingDiv.innerHTML = `
+                    <div class="max-w-[80%] bg-white border border-gray-200 rounded-lg rounded-tl-none p-3">
+                        <div class="flex gap-1">
+                            <div class="w-2 h-2 bg-gray-400 rounded-full animate-bounce"></div>
+                            <div class="w-2 h-2 bg-gray-400 rounded-full animate-bounce [animation-delay:0.2s]"></div>
+                            <div class="w-2 h-2 bg-gray-400 rounded-full animate-bounce [animation-delay:0.4s]"></div>
+                        </div>
+                    </div>
+                `;
+                messagesContainer.appendChild(loadingDiv);
+                messagesContainer.scrollTop = messagesContainer.scrollHeight;
+
+                try {
+                    const response = await fetch('/ask', {
+                        method: 'POST',
+                        headers: {
+                            'Content-Type': 'application/json'
+                        },
+                        body: JSON.stringify({ question: message })
+                    });
+
+                    const data = await response.json();
+
+                    loadingDiv.remove();
+
+                    const botMessageDiv = document.createElement('div');
+                    botMessageDiv.className = 'flex';
+                    botMessageDiv.innerHTML = `
+                        <div class="max-w-[80%] bg-white border border-gray-200 rounded-lg rounded-tl-none p-3">${marked.parse(data.message)}</div>
+                    `;
+                    messagesContainer.appendChild(botMessageDiv);
+                    messagesContainer.scrollTop = messagesContainer.scrollHeight;
+
+                } catch (error) {
+                    loadingDiv.remove();
+
+                    const errorDiv = document.createElement('div');
+                    errorDiv.className = 'flex';
+                    errorDiv.innerHTML = `
+                        <div class="max-w-[80%] bg-red-50 text-red-500 border border-red-200 rounded-lg rounded-tl-none p-3">
+                            Sorry, there was an error processing your request. Please try again.
+                        </div>
+                    `;
+                    messagesContainer.appendChild(errorDiv);
+                    messagesContainer.scrollTop = messagesContainer.scrollHeight;
+                    
+                    console.error('Error:', error);
+                }
+            }
+        }
+        
+        // Handle message sending
+        const sendButton = document.getElementById('send-button');
+        sendButton.addEventListener('click', () => {
+            const message = textarea.value.trim();
+            if (message) {
+                sendMessage(message);
+            }
+        });
+        
+        // Markdown preview functionality
+        const markdownInput = document.getElementById('markdown-input');
+        const markdownOutput = document.getElementById('markdown-output');
+        
+        markdownInput.addEventListener('input', () => {
+            markdownOutput.innerHTML = marked.parse(markdownInput.value);
+        });
+        
+        // Initialize citation click handlers
+        document.querySelectorAll('.citation').forEach(citation => {
+            citation.addEventListener('click', () => {
+                alert(`Opening ${citation.getAttribute('data-source')} at location: ${citation.getAttribute('data-page') || citation.getAttribute('data-row')}`);
+            });
+        });
+    </script>
+</body>
+</html>

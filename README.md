@@ -1,6 +1,62 @@
 # Business Intelligence AI Agent System
 
-A comprehensive business intelligence system that supports both SQLite and PostgreSQL databases for data analysis, visualization, and automated insights generation.
+A comprehensive business intelligence system that supports both SQLite and PostgreSQL databases for data analysis, visualization, and automated insights generation.  
+BISEE provides two application versions:
+- V1: Single-file Streamlit prototype (app.py) for rapid experimentation.
+- V2: Production-oriented split architecture (FastAPI backend in app/ + React/Vite frontend in frontend/).
+
+## Repository Structure (BISEE)
+
+```
+bisee/
+├── app.py                # V1 Streamlit prototype (monolithic)
+├── app/                  # V2 backend (FastAPI services, extends logic from app.py)
+├── frontend/             # V2 React + Vite frontend consuming FastAPI responses
+├── assets/               # Demo & documentation videos (FinalBiseeV1, FinalBiseeV2)
+├── requirements.txt
+└── README.md
+```
+
+### Version Overview
+
+- V1 (Streamlit - app.py):
+  - Immediate UI for BI exploration.
+  - Direct invocation of BusinessIntelligenceAgent.
+  - Good for demos and quick testing.
+- V2 (FastAPI + React):
+  - Backend (app/): Exposes REST endpoints for table listing, analysis, reporting, visualization metadata.
+  - Frontend (frontend/): React/Vite client consuming API, enabling richer UX and future expansion.
+  - Separation improves scalability, deployment flexibility, and integration.
+
+### Running V1 (Streamlit)
+
+```bash
+pip install -r requirements.txt
+streamlit run app.py
+```
+
+### Running V2 (Backend + Frontend)
+
+Backend (FastAPI):
+```bash
+pip install -r requirements.txt
+uvicorn app.main:app --host 0.0.0.0 --port 8000 --reload
+```
+
+Frontend (React/Vite):
+```bash
+cd frontend
+npm install
+npm run dev
+```
+Configure API base URL (e.g. http://localhost:8000) in frontend env or config file.
+
+### Assets (Demo Videos)
+
+Located in assets/:
+- [FinalBiseeV1.mp4](https://github.com/jamilmuhammad/bisee/blob/main/assets/FinalBiseeV1.mp4) demonstrates Streamlit workflow.
+- [FinalBiseeV2.mp4](https://github.com/jamilmuhammad/bisee/blob/main/assets/FinalBiseeV2.mov) demonstrates API + React interaction.
+Use them for onboarding, feature explanation, or presentations.
 
 ## Features
 
@@ -241,6 +297,7 @@ The system automatically creates sample transaction data for demonstration:
 ```bash
 python app.py
 ```
+(Above corresponds to V1 Streamlit usage. For V2 use uvicorn + npm dev as shown earlier.)
 
 ### PostgreSQL Example
 ```bash
@@ -311,3 +368,5 @@ Common issues:
 - **Import errors**: Install missing dependencies with `pip install -r requirements.txt`
 - **Connection failures**: Check database credentials and network connectivity
 - **Permission errors**: Ensure database user has required privileges
+
+

@@ -1,1150 +1,3195 @@
-import sqlite3
-import pandas as pd
+import os
+import uuid
+from datetime import datetime
+from typing import Dict, List, Optional, Any
+from dataclasses import dataclass
+from dotenv import load_dotenv
 import json
+import base64
+from io import BytesIO
+
+import pymongo
+import psycopg2
+from psycopg2.extras import RealDictCursor
+import streamlit as st
+from pydantic import BaseModel
+
+import groq
+import contextlib
+from langchain.schema import BaseMessage, HumanMessage, AIMessage
+from langchain.prompts import PromptTemplate
+from langchain_groq import ChatGroq
+from langgraph.graph import StateGraph, END
+from langgraph.graph.message import add_messages
+from typing_extensions import TypedDict, Annotated
+
+import logging
+import re
+
+# Visualization imports
 import matplotlib.pyplot as plt
 import seaborn as sns
-from typing import Dict, List, Any, Tuple, Optional
+import pandas as pd
 import numpy as np
-from datetime import datetime
+
+# Predictive analysis imports
+from sklearn.linear_model import LinearRegression
+from sklearn.metrics import mean_absolute_error, mean_squared_error
+from sklearn.preprocessing import StandardScaler
 import warnings
 warnings.filterwarnings('ignore')
 
-try:
-    import psycopg2
-    from psycopg2.extras import RealDictCursor
-    POSTGRESQL_AVAILABLE = True
-except ImportError:
-    POSTGRESQL_AVAILABLE = False
-    print("⚠️  PostgreSQL support not available. Install psycopg2 to use PostgreSQL: pip install psycopg2-binary")
+import calendar
 
-class DatabaseConnector:
-    """Handles database connections and schema analysis for SQLite and PostgreSQL"""
+import requests
+
+# Time series forecasting imports
+try:
+    from statsmodels.tsa.arima.model import ARIMA
+    from statsmodels.tsa.seasonal import seasonal_decompose
+    from statsmodels.tsa.holtwinters import ExponentialSmoothing
+    STATSMODELS_AVAILABLE = True
+except ImportError:
+    STATSMODELS_AVAILABLE = False
+
+try:
+    from prophet import Prophet
+    PROPHET_AVAILABLE = True
+except ImportError:
+    PROPHET_AVAILABLE = False
+
+# Configure logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(name)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('financial_insights.log'),
+        logging.StreamHandler()
+    ]
+)
+logger = logging.getLogger(__name__)
+
+# Load environment variables
+load_dotenv()
+
+# Configuration
+class Config:
+    GROQ_API_KEY = st.secrets.get("GROQ_API_KEY") or os.getenv("GROQ_API_KEY")
+    MONGODB_URL = st.secrets.get("MONGODB_URL") or os.getenv("MONGODB_URL", "mongodb://localhost:27017")
+    POSTGRES_URL = st.secrets.get("POSTGRES_URL") or os.getenv("POSTGRES_URL")
+    DATABASE_NAME = st.secrets.get("DATABASE_NAME") or os.getenv("DATABASE_NAME", "rag_chatbot")
+    GROQ_MODEL = st.secrets.get("GROQ_MODEL") or os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
+    LANGSMITH_API_KEY = st.secrets.get("LANGSMITH_API_KEY") or os.getenv("LANGSMITH_API_KEY")
+    LANGSMITH_PROJECT = st.secrets.get("LANGSMITH_PROJECT") or os.getenv("LANGSMITH_PROJECT", "bisee-rag-chatbot")
+    LANGSMITH_ENDPOINT = st.secrets.get("LANGSMITH_ENDPOINT") or os.getenv("LANGSMITH_ENDPOINT", "https://api.smith.langchain.com")
+    POSTGRES_CONNECT_TIMEOUT = int(st.secrets.get("POSTGRES_CONNECT_TIMEOUT") or os.getenv("POSTGRES_CONNECT_TIMEOUT", "5"))
+
+# LangSmith Setup - Proper Environment Variable Configuration
+if Config.LANGSMITH_API_KEY:
+    os.environ["LANGCHAIN_TRACING_V2"] = st.secrets.get("LANGCHAIN_TRACING_V2") or "true"
+    os.environ["LANGCHAIN_ENDPOINT"] = st.secrets.get("LANGCHAIN_ENDPOINT") or Config.LANGSMITH_ENDPOINT
+    os.environ["LANGCHAIN_API_KEY"] = st.secrets.get("LANGCHAIN_API_KEY") or Config.LANGSMITH_API_KEY
+    os.environ["LANGCHAIN_PROJECT"] = st.secrets.get("LANGCHAIN_PROJECT") or Config.LANGSMITH_PROJECT
+    logger.info(f"LangSmith tracing enabled for project: {Config.LANGSMITH_PROJECT}")
+else:
+    logger.warning("LangSmith API key not found. Tracing disabled.")
+
+# Optional: Import langsmith for custom tracking
+try:
+    from langsmith import Client
+    from langsmith.run_helpers import traceable
     
-    def __init__(self, db_type: str = "sqlite", db_path: str = None, **kwargs):
-        """
-        Initialize database connector
+    langsmith_client = Client(
+        api_key=Config.LANGSMITH_API_KEY,
+        api_url=Config.LANGSMITH_ENDPOINT
+    ) if Config.LANGSMITH_API_KEY else None
+    
+    LANGSMITH_AVAILABLE = True
+except ImportError:
+    logger.warning("langsmith package not installed. Install with: pip install langsmith")
+    langsmith_client = None
+    LANGSMITH_AVAILABLE = False
+    
+    # Create dummy decorator if langsmith not available
+    def traceable(*args, **kwargs):
+        def decorator(func):
+            return func
+        return decorator
+
+# Pydantic models for structured responses
+class ChatRequest(BaseModel):
+    message: str
+    session_id: Optional[str] = None
+
+class ChatResponse(BaseModel):
+    response: str
+    session_id: str
+    query_type: str
+    generated_sql: Optional[str] = None
+    data_query_result: Optional[Dict[str, Any]] = None
+    markdown_result: Optional[str] = None
+    visualization_result: Optional[str] = None  # Base64 encoded image
+
+class VisualizationRequest(BaseModel):
+    chart_type: str
+    data: List[Dict[str, Any]]
+    columns: List[str]
+    title: str
+    x_axis: Optional[str] = None
+    y_axis: Optional[str] = None
+
+# Database connections
+class DatabaseManager:
+    def __init__(self):
+        self.mongo_client = pymongo.MongoClient(Config.MONGODB_URL)
+        self.mongo_db = self.mongo_client[Config.DATABASE_NAME]
+        self.sessions_collection = self.mongo_db.sessions
         
-        Args:
-            db_type: Database type - 'sqlite' or 'postgresql'
-            db_path: For SQLite - path to database file
-            **kwargs: For PostgreSQL - host, port, database, user, password
-        """
-        self.db_type = db_type.lower()
-        self.connection = None
-        self.schema_info = {}
-        
-        if self.db_type == "sqlite":
-            self.db_path = db_path or "business_data.db"
-            self.connection_params = {"db_path": self.db_path}
-        elif self.db_type == "postgresql":
-            if not POSTGRESQL_AVAILABLE:
-                raise ImportError("PostgreSQL support requires psycopg2. Install with: pip install psycopg2-binary")
-            
-            self.connection_params = {
-                "host": kwargs.get("host", "localhost"),
-                "port": kwargs.get("port", 5432),
-                "database": kwargs.get("database", "business_data"),
-                "user": kwargs.get("user", "postgres"),
-                "password": kwargs.get("password", "")
-            }
-        else:
-            raise ValueError(f"Unsupported database type: {db_type}. Use 'sqlite' or 'postgresql'")
-        
-    def connect(self):
-        """Establish database connection"""
+    def get_postgres_connection(self):
+        if not Config.POSTGRES_URL:
+            raise ValueError("PostgreSQL URL is not configured.")
+        return psycopg2.connect(Config.POSTGRES_URL, cursor_factory=RealDictCursor)
+    
+    @traceable(name="save_session")
+    def save_session(self, session_id: str, message: str, response: str, query_type: str):
+        session_data = {
+            "session_id": session_id,
+            "timestamp": datetime.utcnow(),
+            "user_message": message,
+            "bot_response": response,
+            "query_type": query_type
+        }
+        self.sessions_collection.insert_one(session_data)
+    
+    @traceable(name="get_session_context")
+    def get_session_context(self, session_id: str, limit: int = 5) -> List[Dict]:
+        return list(self.sessions_collection.find(
+            {"session_id": session_id}
+        ).sort("timestamp", -1).limit(limit))
+
+# Query Executor
+class QueryExecutor:
+    def __init__(self, db_manager: DatabaseManager):
+        self.db_manager = db_manager
+    
+    @traceable(name="execute_query")
+    def execute_query(self, query: str) -> Dict[str, Any]:
         try:
-            if self.db_type == "sqlite":
-                self.connection = sqlite3.connect(self.connection_params["db_path"])
-                self.connection.row_factory = sqlite3.Row
-                print(f"✅ Connected to SQLite database: {self.connection_params['db_path']}")
-            elif self.db_type == "postgresql":
-                self.connection = psycopg2.connect(
-                    host=self.connection_params["host"],
-                    port=self.connection_params["port"],
-                    database=self.connection_params["database"],
-                    user=self.connection_params["user"],
-                    password=self.connection_params["password"],
-                    cursor_factory=RealDictCursor
-                )
-                print(f"✅ Connected to PostgreSQL database: {self.connection_params['database']} at {self.connection_params['host']}")
-            
-            return True
+            with self.db_manager.get_postgres_connection() as conn:
+                cursor = conn.cursor()
+                cursor.execute(query)
+                
+                results = cursor.fetchall()
+                column_names = [desc[0] for desc in cursor.description]
+                
+                return {
+                    "success": True,
+                    "data": results,
+                    "columns": column_names,
+                    "row_count": len(results)
+                }
         except Exception as e:
-            print(f"❌ Database connection failed: {e}")
-            return False
+            return {
+                "success": False,
+                "error": str(e),
+                "data": [],
+                "columns": [],
+                "row_count": 0
+            }
+
+# Database Schema Inspector
+class SchemaInspector:
+    def __init__(self, db_manager: DatabaseManager):
+        self.db_manager = db_manager
+        self._schema_cache = None
     
-    def close(self):
-        """Close database connection"""
-        if self.connection:
-            if self.db_type == "postgresql":
-                self.connection.close()
-            elif self.db_type == "sqlite":
-                self.connection.close()
-            self.connection = None
-            print("✅ Database connection closed")
-    
-    def __enter__(self):
-        """Context manager entry"""
-        self.connect()
-        return self
-    
-    def __exit__(self, exc_type, exc_val, exc_tb):
-        """Context manager exit"""
-        self.close()
-    
-    def get_tables(self) -> List[str]:
-        """Get all tables in the database"""
-        if not self.connection:
-            return []
-        
-        cursor = self.connection.cursor()
-        
-        if self.db_type == "sqlite":
-            cursor.execute("SELECT name FROM sqlite_master WHERE type='table';")
-            tables = [row[0] for row in cursor.fetchall()]
-        elif self.db_type == "postgresql":
+    @traceable(name="get_schema_info")
+    @st.cache_data(ttl=600)
+    def get_schema_info(_self) -> Dict[str, Any]:
+        if _self._schema_cache:
+            return _self._schema_cache
+            
+        with _self.db_manager.get_postgres_connection() as conn:
+            cursor = conn.cursor()
+            
+            # Get all tables
             cursor.execute("""
                 SELECT table_name 
                 FROM information_schema.tables 
-                WHERE table_schema = 'public' AND table_type = 'BASE TABLE';
+                WHERE table_schema = 'public'
             """)
             tables = [row['table_name'] for row in cursor.fetchall()]
-        
-        cursor.close()
-        return tables
-    
-    def get_schema_info(self, table_name: str) -> Dict:
-        """Get detailed schema information for a table"""
-        if not self.connection:
-            return {}
-        
-        cursor = self.connection.cursor()
-        
-        schema_info = {
-            'table_name': table_name,
-            'columns': [],
-            'primary_keys': [],
-            'foreign_keys': [],
-            'row_count': 0
-        }
-        
-        if self.db_type == "sqlite":
-            # SQLite schema query
-            cursor.execute(f"PRAGMA table_info({table_name})")
-            columns = cursor.fetchall()
             
-            for col in columns:
-                schema_info['columns'].append({
-                    'name': col[1],
-                    'type': col[2],
-                    'not_null': bool(col[3]),
-                    'default': col[4],
-                    'primary_key': bool(col[5])
-                })
-                
-                if col[5]:  # Primary key
-                    schema_info['primary_keys'].append(col[1])
-            
-            # Get foreign keys for SQLite
-            cursor.execute(f"PRAGMA foreign_key_list({table_name})")
-            fks = cursor.fetchall()
-            for fk in fks:
-                schema_info['foreign_keys'].append({
-                    'column': fk[3],
-                    'references_table': fk[2],
-                    'references_column': fk[4]
-                })
-                
-        elif self.db_type == "postgresql":
-            # PostgreSQL schema query
-            cursor.execute("""
-                SELECT 
-                    c.column_name,
-                    c.data_type,
-                    c.is_nullable,
-                    c.column_default,
-                    CASE WHEN pk.column_name IS NOT NULL THEN true ELSE false END as is_primary_key
-                FROM information_schema.columns c
-                LEFT JOIN (
-                    SELECT kcu.column_name
-                    FROM information_schema.table_constraints tc
-                    JOIN information_schema.key_column_usage kcu
-                        ON tc.constraint_name = kcu.constraint_name
-                        AND tc.table_schema = kcu.table_schema
-                    WHERE tc.constraint_type = 'PRIMARY KEY'
-                        AND tc.table_name = %s
-                        AND tc.table_schema = 'public'
-                ) pk ON c.column_name = pk.column_name
-                WHERE c.table_name = %s 
-                    AND c.table_schema = 'public'
-                ORDER BY c.ordinal_position;
-            """, (table_name, table_name))
-            columns = cursor.fetchall()
-            
-            for col in columns:
-                schema_info['columns'].append({
-                    'name': col['column_name'],
-                    'type': col['data_type'],
-                    'not_null': col['is_nullable'] == 'NO',
-                    'default': col['column_default'],
-                    'primary_key': col['is_primary_key']
-                })
-                
-                if col['is_primary_key']:  # Primary key
-                    schema_info['primary_keys'].append(col['column_name'])
-            
-            # Get foreign keys for PostgreSQL
-            cursor.execute("""
-                SELECT
-                    kcu.column_name,
-                    ccu.table_name AS foreign_table_name,
-                    ccu.column_name AS foreign_column_name
-                FROM information_schema.table_constraints AS tc
-                JOIN information_schema.key_column_usage AS kcu
-                    ON tc.constraint_name = kcu.constraint_name
-                    AND tc.table_schema = kcu.table_schema
-                JOIN information_schema.constraint_column_usage AS ccu
-                    ON ccu.constraint_name = tc.constraint_name
-                    AND ccu.table_schema = tc.table_schema
-                WHERE tc.constraint_type = 'FOREIGN KEY'
-                    AND tc.table_name = %s
-                    AND tc.table_schema = 'public';
-            """, (table_name,))
-            fks = cursor.fetchall()
-            for fk in fks:
-                schema_info['foreign_keys'].append({
-                    'column': fk['column_name'],
-                    'references_table': fk['foreign_table_name'],
-                    'references_column': fk['foreign_column_name']
-                })
+            schema_info = {}
+            for table in tables:
+                cursor.execute(f"""
+                    SELECT column_name, data_type, is_nullable, column_default
+                    FROM information_schema.columns 
+                    WHERE table_name = '{table}'
+                    ORDER BY ordinal_position
+                """)
+                columns = cursor.fetchall()
+                schema_info[table] = {
+                    'columns': columns,
+                    'sample_data': _self._get_sample_data(cursor, table)
+                }
         
-        # Get row count (works for both databases)
-        if self.db_type == "postgresql":
-            cursor.execute(f'SELECT COUNT(*) FROM "{table_name}"')
-        else:
-            cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
-        result = cursor.fetchone()
-        if self.db_type == "postgresql":
-            schema_info['row_count'] = result['count']
-        else:
-            schema_info['row_count'] = result[0]
-        
-        cursor.close()
+        _self._schema_cache = schema_info
         return schema_info
     
-    def execute_query(self, query: str) -> pd.DataFrame:
-        """Execute SQL query and return DataFrame"""
-        if not self.connection:
-            return pd.DataFrame()
+    def _get_sample_data(self, cursor, table_name: str) -> List[Dict]:
+        try:
+            cursor.execute(f"SELECT * FROM {table_name} LIMIT 3")
+            return cursor.fetchall()
+        except:
+            return []
+
+# Prompt Templates for different agents
+class PromptTemplates:
+    @staticmethod
+    def get_router_prompt():
+        return PromptTemplate(
+            input_variables=["user_input", "context"],
+            template="""
+You are a query router that classifies user inputs into different categories.
+
+Categories:
+1. "sql_query" - Questions about data analysis, counts, statistics, reports, or database queries
+2. "visualization" - Requests for charts, graphs, plots, or visual representations
+3. "general" - General questions, greetings, or unclear requests
+
+Context from previous conversation:
+{context}
+
+User Input: {user_input}
+
+Based on the user input, classify this into one of the three categories above.
+Look for keywords like:
+- SQL: "count", "how many", "show", "list", "average", "sum", "total", "find", "data"
+- Visualization: "chart", "graph", "plot", "visualize", "show chart", "bar chart", "pie chart"
+- General: greetings, unclear requests, non-data related questions
+
+Return only the category name: sql_query, visualization, or general
+"""
+        )
+
+    @staticmethod
+    def get_sql_generator_prompt():
+        return PromptTemplate(
+            input_variables=["user_input", "schema_info", "context"],
+            template="""
+You are an expert SQL query generator for PostgreSQL. Generate safe, efficient SELECT queries only.
+
+STRICT RULES:
+- ONLY SELECT queries (no INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, etc.)
+- Use proper PostgreSQL syntax
+- Include appropriate WHERE clauses, ORDER BY, LIMIT as needed
+- Use aggregate functions (COUNT, SUM, AVG, MIN, MAX) when appropriate
+- No complex subqueries or CTEs unless absolutely necessary
+- No user-defined functions or stored procedures
+
+Database Schema:
+{schema_info}
+
+Previous Context:
+{context}
+
+User Request: {user_input}
+
+Generate a clean, executable SQL query that answers the user's question.
+If the request cannot be fulfilled safely, return "UNSUPPORTED_QUERY".
+
+Return only the SQL query without any formatting or explanation.
+"""
+        )
+
+    @staticmethod
+    def get_reflection_prompt():
+        return PromptTemplate(
+            input_variables=["user_input", "sql_query", "query_results", "current_response"],
+            template="""
+You are a reflection agent that reviews and improves responses for accuracy and completeness.
+
+User Question: {user_input}
+Generated SQL: {sql_query}
+Query Results: {query_results}
+Current Response: {current_response}
+
+Review the current response and provide feedback on:
+1. Accuracy - Does it correctly answer the user's question?
+2. Completeness - Are all aspects of the question addressed?
+3. Clarity - Is the response clear and understandable?
+4. Data interpretation - Are the results properly interpreted?
+
+Provide specific feedback and suggestions for improvement.
+If the response is good, simply return "APPROVED".
+"""
+        )
+
+    @staticmethod
+    def get_response_refiner_prompt():
+        return PromptTemplate(
+            input_variables=["user_input", "sql_query", "query_results", "current_response", "reflection_feedback"],
+            template="""
+You are a response refinement agent that improves responses based on reflection feedback.
+
+User Question: {user_input}
+Generated SQL: {sql_query}
+Query Results: {query_results}
+Current Response: {current_response}
+Reflection Feedback: {reflection_feedback}
+
+Based on the reflection feedback, create an improved, more accurate and precise response.
+Make sure to:
+1. Address all points raised in the feedback
+2. Provide clear, actionable insights
+3. Use proper formatting and structure
+4. Include relevant context and explanations
+
+Return the refined response:
+"""
+        )
+
+    @staticmethod
+    def get_visualization_prompt():
+        return PromptTemplate(
+            input_variables=["user_input", "query_results", "columns"],
+            template="""
+You are a visualization recommendation agent that suggests appropriate chart types based on data.
+
+User Request: {user_input}
+Query Results: {query_results}
+Available Columns: {columns}
+
+Based on the data and user request, recommend the best visualization type and configuration.
+
+Available chart types:
+- bar: For categorical data comparison
+- line: For time series or trend data
+- pie: For proportional data (max 10 categories)
+- scatter: For correlation between two variables
+- histogram: For distribution of numerical data
+
+Return a JSON object with:
+{{
+    "chart_type": "bar|line|pie|scatter|histogram",
+    "title": "Chart title",
+    "x_axis": "column name for x-axis",
+    "y_axis": "column name for y-axis",
+    "description": "Brief description of what the chart shows"
+}}
+"""
+        )
+
+    @staticmethod
+    def get_general_response_prompt():
+        return PromptTemplate(
+            input_variables=["user_input", "available_tables", "context"],
+            template="""
+You are a helpful database assistant that provides general information and guidance.
+
+User Input: {user_input}
+Available Tables: {available_tables}
+Context: {context}
+
+Provide a helpful response that:
+1. Addresses the user's question or comment
+2. Offers guidance on what they can do with the available data
+3. Suggests example queries they might find useful
+4. Maintains a friendly, professional tone
+
+If the user is greeting you, respond appropriately and explain your capabilities.
+"""
+        )
+
+# Enhanced LangGraph State
+class AgentState(TypedDict):
+    messages: Annotated[List[BaseMessage], add_messages]
+    user_input: str
+    session_id: str
+    query_types: List[str]  # Changed from query_type to query_types array
+    context: str
+    sql_query: str
+    query_results: Dict[str, Any]
+    query_data: List[Dict[str, Any]]  # New variable for only query result data
+    final_response: str
+    # New fields for enhanced response
+    generated_sql: Optional[str]
+    data_query_result: Optional[Dict[str, Any]]
+    markdown_result: Optional[str]
+    visualization_result: Optional[str]
+    reflection_feedback: Optional[str]
+    refined_response: Optional[str]
+    chart_type: Optional[str]
+    visualization_data: Optional[Dict[str, Any]]
+    # New fields for predictive and prescriptive analysis
+    analysis_type: Optional[str]  # descriptive, predictive, prescriptive
+    forecast_results: Optional[Dict[str, Any]]
+    simulation_results: Optional[Dict[str, Any]]
+    predictive_model: Optional[str]  # ARIMA, Prophet, Linear, etc.
+    simulation_parameters: Optional[Dict[str, Any]]
+    data_validation: Optional[Dict[str, Any]]  # Data validation results
+
+# Database Schema Inspector
+class SchemaInspector:
+    def __init__(self, db_manager: DatabaseManager):
+        self.db_manager = db_manager
+        self._schema_cache = None
+    
+    @st.cache_data(ttl=600)
+    def get_schema_info(_self) -> Dict[str, Any]:
+        if _self._schema_cache:
+            return _self._schema_cache
+            
+        with _self.db_manager.get_postgres_connection() as conn:
+            cursor = conn.cursor()
+            
+            # Get all tables
+            cursor.execute("""
+                SELECT table_name 
+                FROM information_schema.tables 
+                WHERE table_schema = 'public'
+            """)
+            tables = [row['table_name'] for row in cursor.fetchall()]
+            
+            schema_info = {}
+            for table in tables:
+                cursor.execute(f"""
+                    SELECT column_name, data_type, is_nullable, column_default
+                    FROM information_schema.columns 
+                    WHERE table_name = '{table}'
+                    ORDER BY ordinal_position
+                """)
+                columns = cursor.fetchall()
+                schema_info[table] = {
+                    'columns': columns,
+                    'sample_data': _self._get_sample_data(cursor, table)
+                }
+        
+        _self._schema_cache = schema_info
+        return schema_info
+    
+    def _get_sample_data(self, cursor, table_name: str) -> List[Dict]:
+        try:
+            cursor.execute(f"SELECT * FROM {table_name} LIMIT 3")
+            return cursor.fetchall()
+        except:
+            return []
+
+# Prompt Templates for different agents
+class PromptTemplates:
+    @staticmethod
+    def get_router_prompt():
+        return PromptTemplate(
+            input_variables=["user_input", "context"],
+            template="""
+You are a query router that classifies user inputs into different categories.
+
+Categories:
+1. "sql_query" - Questions about data analysis, counts, statistics, reports, or database queries
+2. "visualization" - Requests for charts, graphs, plots, or visual representations
+3. "general" - General questions, greetings, or unclear requests
+
+Context from previous conversation:
+{context}
+
+User Input: {user_input}
+
+Based on the user input, classify this into one of the three categories above.
+Look for keywords like:
+- SQL: "count", "how many", "show", "list", "average", "sum", "total", "find", "data"
+- Visualization: "chart", "graph", "plot", "visualize", "show chart", "bar chart", "pie chart"
+- General: greetings, unclear requests, non-data related questions
+
+Return only the category name: sql_query, visualization, or general
+"""
+        )
+
+    @staticmethod
+    def get_sql_generator_prompt():
+        return PromptTemplate(
+            input_variables=["user_input", "schema_info", "context"],
+            template="""
+You are an expert SQL query generator for PostgreSQL. Generate safe, efficient SELECT queries only.
+
+STRICT RULES:
+- ONLY SELECT queries (no INSERT, UPDATE, DELETE, DROP, ALTER, CREATE, etc.)
+- Use proper PostgreSQL syntax
+- Include appropriate WHERE clauses, ORDER BY, LIMIT as needed
+- Use aggregate functions (COUNT, SUM, AVG, MIN, MAX) when appropriate
+- No complex subqueries or CTEs unless absolutely necessary
+- No user-defined functions or stored procedures
+
+INTERPRETATION GUIDELINES:
+- For **prescriptive** queries asking to 'simulate' or 'project' a percentage (e.g., 'simulate 10%'), interpret this as calculating the original value **plus** that percentage. For a 10% simulation, calculate `original_value * 1.1`.
+**- For predictive queries asking to 'forecast' or 'predict' future values (e.g., 'forecast sales for the next 6 months'), your role is to write a SQL query that retrieves the necessary historical data. The query should select the relevant time period (e.g., month, year) and the metric to be forecasted. Ensure the results are ordered chronologically to create a clean time series.**
+
+Database Schema:
+{schema_info}
+
+Previous Context:
+{context}
+
+User Request: {user_input}
+
+Generate a clean, executable SQL query that answers the user's question.
+If the request cannot be fulfilled safely, return "UNSUPPORTED_QUERY".
+
+Return only the SQL query without any formatting or explanation.
+"""
+        )
+
+    @staticmethod
+    def get_reflection_prompt():
+        return PromptTemplate(
+            input_variables=["user_input", "sql_query", "query_results", "current_response"],
+            template="""
+You are a reflection agent that reviews and improves responses for accuracy and completeness.
+
+User Question: {user_input}
+Generated SQL: {sql_query}
+Query Results: {query_results}
+Current Response: {current_response}
+
+Review the current response and provide feedback on:
+1. Accuracy - Does it correctly answer the user's question?
+2. Completeness - Are all aspects of the question addressed?
+3. Clarity - Is the response clear and understandable?
+4. Data interpretation - Are the results properly interpreted?
+
+Provide specific feedback and suggestions for improvement.
+If the response is good, simply return "APPROVED".
+"""
+        )
+
+    @staticmethod
+    def get_response_refiner_prompt():
+        return PromptTemplate(
+            input_variables=["user_input", "sql_query", "query_results", "current_response", "reflection_feedback"],
+            template="""
+You are a response refinement agent that improves responses based on reflection feedback.
+
+User Question: {user_input}
+Generated SQL: {sql_query}
+Query Results: {query_results}
+Current Response: {current_response}
+Reflection Feedback: {reflection_feedback}
+
+Based on the reflection feedback, create an improved, more accurate and precise response.
+Make sure to:
+1. Address all points raised in the feedback
+2. Provide clear, actionable insights
+3. Use proper formatting and structure
+4. Include relevant context and explanations
+
+Return the refined response:
+"""
+        )
+
+    @staticmethod
+    def get_visualization_prompt():
+        return PromptTemplate(
+            input_variables=["user_input", "query_results", "columns"],
+            template="""
+You are a visualization recommendation agent that suggests appropriate chart types based on data.
+
+User Request: {user_input}
+Query Results: {query_results}
+Available Columns: {columns}
+
+Based on the data and user request, recommend the best visualization type and configuration.
+
+Available chart types:
+- bar: For categorical data comparison
+- line: For time series or trend data
+- pie: For proportional data (max 10 categories)
+- scatter: For correlation between two variables
+- histogram: For distribution of numerical data
+
+Return a JSON object with:
+{{
+    "chart_type": "bar|line|pie|scatter|histogram",
+    "title": "Chart title",
+    "x_axis": "column name for x-axis",
+    "y_axis": "column name for y-axis",
+    "description": "Brief description of what the chart shows"
+}}
+"""
+        )
+
+    @staticmethod
+    def get_general_response_prompt():
+        return PromptTemplate(
+            input_variables=["user_input", "available_tables", "context"],
+            template="""
+You are a helpful database assistant that provides general information and guidance.
+
+User Input: {user_input}
+Available Tables: {available_tables}
+Context: {context}
+
+Provide a helpful response that:
+1. Addresses the user's question or comment
+2. Offers guidance on what they can do with the available data
+3. Suggests example queries they might find useful
+4. Maintains a friendly, professional tone
+
+If the user is greeting you, respond appropriately and explain your capabilities.
+"""
+        )
+
+    @staticmethod
+    def get_predictive_analysis_prompt():
+        return PromptTemplate(
+            input_variables=["user_input", "query_data", "columns", "analysis_context"],
+            template="""
+You are a predictive analytics expert that analyzes historical data to make forecasts.
+
+User Request: {user_input}
+Historical Data: {query_data}
+Available Columns: {columns}
+Context: {analysis_context}
+
+Based on the historical data provided, determine the best forecasting approach:
+
+1. Identify time-based patterns (trends, seasonality)
+2. Recommend appropriate forecasting model (ARIMA, Prophet, Linear Regression, etc.)
+3. Suggest forecast horizon (periods to predict ahead)
+4. Identify key variables for prediction
+
+Return a JSON object with:
+{{
+    "model_type": "arima|prophet|linear|exponential_smoothing",
+    "forecast_periods": "number of periods to forecast",
+    "time_column": "column name containing dates/time",
+    "target_column": "column name to forecast",
+    "seasonality": "detected seasonality pattern if any",
+    "trend": "detected trend pattern",
+    "confidence_level": "0.95",
+    "description": "Brief explanation of the forecasting approach"
+}}
+"""
+        )
+
+    @staticmethod
+    def get_prescriptive_analysis_prompt():
+        return PromptTemplate(
+            input_variables=["user_input", "query_data", "columns", "descriptive_context"],
+            template="""
+You are a prescriptive analytics expert that performs what-if analysis and simulations.
+
+User Request: {user_input}
+Current Data: {query_data}
+Available Columns: {columns}
+Descriptive Context: {descriptive_context}
+
+Based on the current data and user request, design a simulation or what-if analysis:
+
+1. Identify variables to modify (independent variables)
+2. Determine the target outcome (dependent variable)
+3. Suggest simulation parameters and ranges
+4. Recommend simulation scenarios
+
+Return a JSON object with:
+{{
+    "simulation_type": "what_if|sensitivity|scenario|optimization",
+    "independent_variables": ["list of columns to vary"],
+    "dependent_variable": "target outcome column",
+    "scenarios": [
+        {{
+            "name": "scenario name",
+            "parameters": {{"column": "new_value"}},
+            "description": "what this scenario tests"
+        }}
+    ],
+    "parameter_ranges": {{"column": {{"min": value, "max": value, "step": value}}}},
+    "description": "Brief explanation of the simulation approach"
+}}
+"""
+        )
+
+    @staticmethod
+    def get_query_improvement_prompt():
+        return PromptTemplate(
+            input_variables=["original_query", "validation_issues", "user_intent"],
+            template="""
+You are a SQL optimization expert that improves queries for better visualization and analysis.
+
+Original Query: {original_query}
+Validation Issues: {validation_issues}
+User Intent: {user_intent}
+
+Based on the validation issues, suggest an improved SQL query that:
+1. Returns data suitable for visualization
+2. Has proper column names and data types
+3. Includes appropriate aggregate functions if needed
+4. Uses GROUP BY for categorical analysis when relevant
+5. Includes ORDER BY for logical data sorting
+6. Limits results if dealing with large datasets
+
+Return only the improved SQL query without any formatting or explanation.
+If the original query is already good, return it unchanged.
+"""
+        )
+
+# SQL Query Generator
+class SQLQueryGenerator:
+    def __init__(self, llm: ChatGroq, schema_info: Dict[str, Any]):
+        self.llm = llm
+        self.schema_info = schema_info
+        self.query_prompt = PromptTemplates.get_sql_generator_prompt()
+    
+    def generate_query(self, user_input: str, context: str = "") -> str:
+        schema_str = self._format_schema()
+        
+        prompt = self.query_prompt.format(
+            user_input=user_input,
+            schema_info=schema_str,
+            context=context
+        )
+        
+        response = self.llm.invoke(prompt)
+        query = response.content.strip()
+        
+        # Clean up the query
+        query = self._clean_query(query)
+        
+        logger.info(f"Generated SQL Query: {query}")
+        
+        # Validate query safety
+        if not self._is_safe_query(query):
+            return "UNSUPPORTED_QUERY"
+            
+        return query if query else "UNSUPPORTED_QUERY"
+    
+    def _clean_query(self, query: str) -> str:
+        """Clean and format the SQL query"""
+        # Remove markdown formatting
+        query = re.sub(r'```sql\n(.*?)\n```', r'\1', query, flags=re.DOTALL)
+        query = re.sub(r'```\n(.*?)\n```', r'\1', query, flags=re.DOTALL)
+        
+        # Remove extra whitespace
+        query = ' '.join(query.split())
+        
+        return query.strip()
+    
+    def _format_schema(self) -> str:
+        schema_str = ""
+        for table, info in self.schema_info.items():
+            schema_str += f"\nTable: {table}\n"
+            schema_str += "Columns:\n"
+            for col in info['columns']:
+                schema_str += f"  - {col['column_name']} ({col['data_type']})\n"
+            if info['sample_data']:
+                schema_str += f"Sample data: {info['sample_data'][:2]}\n"
+        return schema_str
+    
+    def _is_safe_query(self, query: str) -> bool:
+        query_upper = query.upper().strip()
+
+        # Must start with SELECT
+        if not query_upper.startswith("SELECT"):
+            return "UNSUPPORTED_QUERY"
+
+        # Blocked keywords
+        blocked_keywords = [
+            'INSERT', 'UPDATE', 'DELETE', 'DROP', 'ALTER', 'CREATE',
+            'TRUNCATE', 'GRANT', 'REVOKE', 'EXEC', 'EXECUTE',
+            'UNION', 'INTERSECT', 'EXCEPT'  # Prevent complex queries
+        ]
+        
+        for keyword in blocked_keywords:
+            if keyword in query_upper:
+                return "UNSUPPORTED_QUERY"
+
+        return True
+
+# Reflection Agent
+class ReflectionAgent:
+    def __init__(self, llm: ChatGroq):
+        self.llm = llm
+        self.reflection_prompt = PromptTemplates.get_reflection_prompt()
+        self.refiner_prompt = PromptTemplates.get_response_refiner_prompt()
+    
+    def reflect_on_response(self, user_input: str, sql_query: str, query_results: Dict[str, Any], current_response: str) -> str:
+        """Reflect on the current response and provide feedback"""
+        prompt = self.reflection_prompt.format(
+            user_input=user_input,
+            sql_query=sql_query,
+            query_results=str(query_results),
+            current_response=current_response
+        )
+        
+        response = self.llm.invoke(prompt)
+        return response.content.strip()
+    
+    def refine_response(self, user_input: str, sql_query: str, query_results: Dict[str, Any], 
+                       current_response: str, reflection_feedback: str) -> str:
+        """Refine the response based on reflection feedback"""
+        if reflection_feedback.strip() == "APPROVED":
+            return current_response
+        
+        prompt = self.refiner_prompt.format(
+            user_input=user_input,
+            sql_query=sql_query,
+            query_results=str(query_results),
+            current_response=current_response,
+            reflection_feedback=reflection_feedback
+        )
+        
+        response = self.llm.invoke(prompt)
+        return response.content.strip()
+
+# Data Validation Agent
+class DataValidationAgent:
+    def __init__(self, llm: ChatGroq):
+        self.llm = llm
+    
+    def validate_data_for_visualization(self, query_results: Dict[str, Any], user_input: str) -> Dict[str, Any]:
+        """Validate if data is suitable for visualization and suggest improvements"""
+        if not query_results.get("success") or not query_results.get("data"):
+            return {
+                "is_valid": False,
+                "error": "No data available for visualization",
+                "suggestions": []
+            }
+        
+        data = query_results["data"]
+        columns = query_results["columns"]
+        
+        # Basic validation checks
+        validation_result = {
+            "is_valid": True,
+            "warnings": [],
+            "suggestions": [],
+            "chart_recommendations": [],
+            "axis_mapping": {}
+        }
+        
+        # Check data structure
+        if len(data) < 2:
+            validation_result["warnings"].append("Very few data points (less than 2 rows)")
+            if len(data) == 0:
+                validation_result["is_valid"] = False
+                validation_result["error"] = "No data rows to visualize"
+                return validation_result
+        
+        # Check column structure
+        if len(columns) < 1:
+            validation_result["is_valid"] = False
+            validation_result["error"] = "No columns available for visualization"
+            return validation_result
+        
+        # Analyze data types and suggest appropriate visualizations
+        df = pd.DataFrame(data)
+        numeric_columns = df.select_dtypes(include=[np.number]).columns.tolist()
+        categorical_columns = df.select_dtypes(include=['object', 'string']).columns.tolist()
+        datetime_columns = []
+        
+        # Try to detect datetime columns
+        for col in categorical_columns:
+            try:
+                pd.to_datetime(df[col], errors='raise')
+                datetime_columns.append(col)
+                categorical_columns.remove(col)
+            except:
+                continue
+        
+        # Determine best axis mapping
+        x_axis = None
+        y_axis = None
+        chart_type = "bar"  # default
+        
+        if datetime_columns:
+            # Time series data
+            x_axis = datetime_columns[0]
+            y_axis = numeric_columns[0] if numeric_columns else columns[1] if len(columns) > 1 else None
+            chart_type = "line"
+            validation_result["chart_recommendations"].append("Line chart recommended for time series data")
+        elif categorical_columns and numeric_columns:
+            # Categorical vs numeric
+            x_axis = categorical_columns[0]
+            y_axis = numeric_columns[0]
+            chart_type = "bar"
+            validation_result["chart_recommendations"].append("Bar chart recommended for categorical vs numeric data")
+        elif len(numeric_columns) >= 2:
+            # Multiple numeric columns
+            x_axis = numeric_columns[0]
+            y_axis = numeric_columns[1]
+            chart_type = "scatter"
+            validation_result["chart_recommendations"].append("Scatter plot recommended for numeric vs numeric data")
+        elif len(columns) >= 2:
+            # Fallback to first two columns
+            x_axis = columns[0]
+            y_axis = columns[1]
+            validation_result["warnings"].append("Using first two columns as axes - results may vary")
+        else:
+            # Single column
+            x_axis = columns[0]
+            y_axis = columns[0]
+            chart_type = "histogram"
+            validation_result["chart_recommendations"].append("Histogram recommended for single numeric column")
+        
+        validation_result["axis_mapping"] = {
+            "x_axis": x_axis,
+            "y_axis": y_axis,
+            "recommended_chart_type": chart_type
+        }
+        
+        # Additional validations based on chart type
+        if chart_type == "pie":
+            if len(data) > 10:
+                validation_result["warnings"].append("Too many categories for pie chart (>10), consider bar chart")
+                validation_result["axis_mapping"]["recommended_chart_type"] = "bar"
+        
+        # Check for null values
+        null_counts = df.isnull().sum()
+        if null_counts.any():
+            validation_result["warnings"].append(f"Null values found in columns: {null_counts[null_counts > 0].to_dict()}")
+        
+        # Data quality suggestions
+        if len(numeric_columns) == 0 and "visualization" in user_input.lower():
+            validation_result["suggestions"].append("Consider using aggregate functions (COUNT, SUM, AVG) to generate numeric data for better visualizations")
+        
+        if len(data) > 100:
+            validation_result["suggestions"].append("Large dataset detected. Consider using LIMIT clause or GROUP BY for cleaner visualizations")
+        
+        return validation_result
+    
+    def suggest_query_improvements(self, original_query: str, validation_result: Dict[str, Any], user_input: str = "") -> str:
+        """Suggest improvements to the SQL query for better visualization"""
+        if not validation_result or validation_result.get("is_valid", True):
+            return original_query
+        
+        # Use LLM to suggest improvements
+        try:
+            improvement_prompt = PromptTemplates.get_query_improvement_prompt()
+            issues = validation_result.get("error", "") + "; " + "; ".join(validation_result.get("warnings", []))
+            
+            prompt = improvement_prompt.format(
+                original_query=original_query,
+                validation_issues=issues,
+                user_intent=user_input
+            )
+            
+            response = self.llm.invoke(prompt)
+            improved_query = response.content.strip()
+            
+            # Clean the query
+            improved_query = improved_query.replace("```sql", "").replace("```", "").strip()
+            
+            return improved_query if improved_query else original_query
+            
+        except Exception as e:
+            logger.error(f"Error improving query: {e}")
+            return original_query
+
+# Visualization Agent
+class VisualizationAgent:
+    def __init__(self, llm: ChatGroq):
+        self.llm = llm
+        self.viz_prompt = PromptTemplates.get_visualization_prompt()
+
+    def _has_multiple_analysis_columns(self, df: pd.DataFrame) -> bool:
+        """
+        Checks if the DataFrame contains columns from different analysis types
+        (e.g., a base metric plus a 'forecast' or 'scenario' column).
+        """
+        analysis_keywords = {
+            'predictive': ['forecast', 'predict', 'yhat'],
+            'prescriptive': ['scenario', 'simulate', 'what if']
+        }
+        
+        found_types = set()
+        
+        # Consider only numeric columns for analysis
+        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+        if not numeric_cols:
+            return False
+
+        has_base_metric = False
+
+        for col in numeric_cols:
+            col_lower = col.lower()
+            is_analysis_col = False
+            
+            # Check for predictive keywords
+            if any(key in col_lower for key in analysis_keywords['predictive']):
+                found_types.add('predictive')
+                is_analysis_col = True
+                
+            # Check for prescriptive keywords
+            if any(key in col_lower for key in analysis_keywords['prescriptive']):
+                found_types.add('prescriptive')
+                is_analysis_col = True
+
+            if not is_analysis_col:
+                has_base_metric = True
+
+        # Return true if we have a base metric AND at least one analysis type,
+        # OR if we have multiple different analysis types (e.g., forecast + scenario).
+        return (has_base_metric and len(found_types) > 0) or (len(found_types) > 1)
+        
+    def generate_chart_config(self, user_input: str, query_results: Dict[str, Any], validation_result: Dict[str, Any] = None) -> Dict[str, Any]:
+        """Generate chart configuration based on query results and validation"""
+        if not query_results.get("success") or not query_results.get("data"):
+            return {"error": "No data available for visualization"}
+        
+        data = query_results["data"]
+        columns = query_results["columns"]
+    
+        logger.info(f"Query results data: {data}")
+        logger.info(f"Query results columns: {columns}")
+        
+        # Use validation results if available
+        if validation_result and validation_result.get("axis_mapping"):
+            axis_mapping = validation_result["axis_mapping"]
+            fallback_config = {
+                "chart_type": axis_mapping.get("recommended_chart_type", "bar"),
+                "title": "Data Visualization",
+                "x_axis": axis_mapping.get("x_axis"),
+                "y_axis": axis_mapping.get("y_axis"),
+                "description": "Chart based on data validation recommendations"
+            }
+        else:
+            # Create a fallback configuration first
+            fallback_config = {
+                "chart_type": "bar",
+                "title": "Data Visualization",
+                "x_axis": columns[0] if columns else None,
+                "y_axis": columns[1] if len(columns) > 1 else columns[0] if columns else None,
+                "description": "Auto-generated chart from query results"
+            }
+        
+        # prompt = self.viz_prompt.format(
+        #     user_input=user_input,
+        #     query_results=str(data[:5]),  # First 5 rows for analysis
+        #     columns=str(columns)
+        # )
+
+        # Fix the string formatting issue - ensure all variables are strings
+        try:
+            prompt_data = {
+                "user_input": str(user_input),
+                "query_results": str(data[:5]) if data else "[]",  # First 5 rows for analysis
+                "columns": str(columns) if columns else "[]"
+            }
+            
+            prompt = self.viz_prompt.format(**prompt_data)
+        except (KeyError, ValueError) as e:
+            logger.warning(f"Prompt formatting error: {e}, using fallback config")
+            return fallback_config
         
         try:
-            if self.db_type == "postgresql":
-                # For pandas operations, use a regular connection without RealDictCursor
-                import psycopg2
-                temp_conn = psycopg2.connect(
-                    host=self.connection_params["host"],
-                    port=self.connection_params["port"],
-                    database=self.connection_params["database"],
-                    user=self.connection_params["user"],
-                    password=self.connection_params["password"]
-                )
-                result = pd.read_sql_query(query, temp_conn)
-                temp_conn.close()
-                return result
-            else:
-                return pd.read_sql_query(query, self.connection)
+            response = self.llm.invoke(prompt)
+            response_content = response.content.strip()
+            
+            # Check if response is empty
+            if not response_content:
+                logger.warning("Empty response from LLM for chart config, using fallback")
+                return fallback_config
+            
+            # Try to extract JSON from response if it's wrapped in markdown
+            if "```json" in response_content:
+                # Extract JSON from markdown code block
+                import re
+                json_match = re.search(r'```json\s*(.*?)\s*```', response_content, re.DOTALL)
+                if json_match:
+                    response_content = json_match.group(1).strip()
+            elif "```" in response_content:
+                # Extract content from any code block
+                import re
+                json_match = re.search(r'```\s*(.*?)\s*```', response_content, re.DOTALL)
+                if json_match:
+                    response_content = json_match.group(1).strip()
+            
+            # Parse JSON
+            config = json.loads(response_content)
+            
+            # Validate required fields and add defaults if missing
+            if not isinstance(config, dict):
+                logger.warning("Invalid config format from LLM, using fallback")
+                return fallback_config
+            
+            # Ensure required fields exist, prioritizing validation results
+            config.setdefault("chart_type", fallback_config["chart_type"])
+            config.setdefault("title", fallback_config["title"])
+            config.setdefault("x_axis", fallback_config["x_axis"])
+            config.setdefault("y_axis", fallback_config["y_axis"])
+            config.setdefault("description", fallback_config["description"])
+            
+            return config
+            
+        except json.JSONDecodeError as e:
+            logger.error(f"JSON decode error in chart config: {e}. Response was: {response_content[:200]}...")
+            return fallback_config
         except Exception as e:
-            print(f"❌ Query execution failed: {e}")
-            return pd.DataFrame()
+            logger.error(f"Error generating chart config: {e}")
+            return fallback_config
     
-    def get_sample_data(self, table_name: str, limit: int = 5) -> pd.DataFrame:
-        """Get sample data from table"""
-        if self.db_type == "postgresql":
-            # Use quoted table name for PostgreSQL
-            query = f'SELECT * FROM "{table_name}" LIMIT {limit}'
-        else:
-            query = f"SELECT * FROM {table_name} LIMIT {limit}"
-        return self.execute_query(query)
+    def create_visualization(self, query_results: Dict[str, Any], chart_config: Dict[str, Any], 
+                           forecast_results: Dict[str, Any] = None, simulation_results: Dict[str, Any] = None,
+                           validation_result: Dict[str, Any] = None) -> str:
+        """Create visualization and return base64 encoded image"""
+        try:
+            if not query_results.get("success") or not query_results.get("data"):
+                return None
 
-class DataAnalyzer:
-    """Analyzes data and generates business insights"""
-    
-    def __init__(self, db_connector: DatabaseConnector):
-        self.db = db_connector
-        self.insights = {}
-        
-    def analyze_table(self, table_name: str) -> Dict:
-        """Comprehensive table analysis"""
-        schema = self.db.get_schema_info(table_name)
-        sample_data = self.db.get_sample_data(table_name, 100)
-        
-        if sample_data.empty:
-            return {"error": "No data available for analysis"}
-        
-        analysis = {
-            'table_name': table_name,
-            'schema': schema,
-            'data_quality': self._analyze_data_quality(sample_data),
-            'statistical_summary': self._generate_statistical_summary(sample_data),
-            'patterns': self._identify_patterns(sample_data),
-            'insights': self._generate_insights(sample_data, schema),
-            'recommendations': self._generate_recommendations(sample_data, schema)
-        }
-        
-        # Add comprehensive text summary
-        analysis['text_summary'] = self._generate_text_summary(analysis, table_name)
-        
-        return analysis
-    
-    def _analyze_data_quality(self, df: pd.DataFrame) -> Dict:
-        """Analyze data quality metrics"""
-        quality_metrics = {
-            'total_rows': len(df),
-            'total_columns': len(df.columns),
-            'missing_values': df.isnull().sum().to_dict(),
-            'duplicate_rows': df.duplicated().sum(),
-            'data_types': df.dtypes.to_dict()
-        }
-        
-        # Convert numpy types to Python types for JSON serialization
-        for col, dtype in quality_metrics['data_types'].items():
-            quality_metrics['data_types'][col] = str(dtype)
-        
-        return quality_metrics
-    
-    def _generate_statistical_summary(self, df: pd.DataFrame) -> Dict:
-        """Generate statistical summary"""
-        numeric_cols = df.select_dtypes(include=[np.number]).columns
-        categorical_cols = df.select_dtypes(include=['object']).columns
-        
-        summary = {
-            'numeric_summary': {},
-            'categorical_summary': {}
-        }
-        
-        # Numeric columns analysis
-        if len(numeric_cols) > 0:
-            summary['numeric_summary'] = df[numeric_cols].describe().to_dict()
-        
-        # Categorical columns analysis
-        for col in categorical_cols:
-            summary['categorical_summary'][col] = {
-                'unique_count': df[col].nunique(),
-                'top_values': df[col].value_counts().head(5).to_dict()
+            df = pd.DataFrame(query_results["data"])
+            
+            # Handle month number to month name conversion
+            if 'month' in df.columns and df['month'].dtype in ['int64', 'int32', 'float64']:
+                df['month_name'] = df['month'].apply(lambda x: calendar.month_name[int(x)] if pd.notna(x) and 1 <= x <= 12 else str(x))
+            elif 'month_name' in df.columns and df['month_name'].dtype == 'object':
+                df['month'] = df['month_name'].apply(lambda x: calendar.month_name.index(x) if x in calendar.month_name else None)
+                
+            # Determine if we should create continuous analysis visualization
+            has_analysis_data = (
+                forecast_results and not forecast_results.get("error") or
+                simulation_results and not simulation_results.get("error") or
+                self._has_multiple_analysis_columns(df)
+            )
+            logger.info(f"Has analysis data: {has_analysis_data}")
+            logger.info(f"Forecast results: {forecast_results}")
+            logger.info(f"Simulation results: {simulation_results}")
+            logger.info(f"Chart config: {chart_config}")
+            logger.info(f"Validation result: {df}")
+            
+            if has_analysis_data:
+                # Build unified multi-line analysis visualization
+                analysis_data = self._prepare_unified_analysis_data(
+                    df=df,
+                    chart_config=chart_config,
+                    forecast_results=forecast_results,
+                    simulation_results=simulation_results,
+                    prefer_last_table=True
+                )
+                img = self._create_unified_continuous_chart(analysis_data, chart_config)
+                # Ensure downstream sees this as a line chart
+                chart_config["chart_type"] = "line"
+                return img
+            else:
+                # Create regular chart based on chart type
+                chart_type = chart_config.get("chart_type", "bar").lower()
+                x_col = chart_config.get("x_axis")
+                y_col = chart_config.get("y_axis")
+                title = chart_config.get("title", "Data Visualization")
+            
+            if validation_result and validation_result.get("axis_mapping"):
+                axis_mapping = validation_result["axis_mapping"]
+                x_col = axis_mapping.get("x_axis")
+                y_col = axis_mapping.get("y_axis")
+                chart_type = axis_mapping.get("recommended_chart_type", chart_config.get("chart_type", "bar"))
+            else:
+                # Enhanced logic for axis determination based on your requirements
+                # If data has 2+ rows and 2+ columns, use column 1 as labels for axis and the rest as data
+                if len(df) >= 2 and len(df.columns) >= 2:
+                    # Column 1 (index 0) is label for the axis
+                    x_col = df.columns[0]
+                    # Column 2 (index 1) is the data for y-axis (descriptive only: first table). If analysis, use last numeric (last table)
+                    if has_analysis_data:
+                        numeric_cols = df.select_dtypes(include=[np.number]).columns.tolist()
+                        y_col = numeric_cols[-1] if numeric_cols else (df.columns[-1] if len(df.columns) > 1 else None)
+                    else:
+                        y_col = df.columns[1] if len(df.columns) > 1 else None
+                
+                chart_type = chart_config.get("chart_type", "bar")
+            
+            # Override with chart config if provided and valid
+            chart_x_col = chart_config.get("x_axis")
+            chart_y_col = chart_config.get("y_axis")
+            
+            if chart_x_col and chart_x_col in df.columns:
+                x_col = chart_x_col
+            if chart_y_col and chart_y_col in df.columns:
+                y_col = chart_y_col
+            
+            # Final validation - ensure we have valid columns
+            if not x_col or x_col not in df.columns:
+                x_col = df.columns[0] if len(df.columns) > 0 else None
+            if not y_col or y_col not in df.columns:
+                y_col = df.columns[1] if len(df.columns) > 1 else df.columns[0]
+            
+            # Create figure
+            plt.figure(figsize=(12, 8))
+            plt.style.use('seaborn-v0_8')
+            
+            title = chart_config.get("title", "Data Visualization")
+            
+            # Check if we should create continuous analysis chart
+            has_forecast = forecast_results and "forecasts" in forecast_results
+            has_simulation = simulation_results and "scenarios" in simulation_results
+            has_forecast_col = any('forecast' in col.lower() for col in df.columns)
+            has_simulation_col = any('simulat' in col.lower() or 'scenario' in col.lower() for col in df.columns)
+            
+            if (has_forecast or has_simulation or has_forecast_col or has_simulation_col) and chart_type in ["line", "bar"]:
+                # Prefer unified multi-line line chart
+                analysis_data = self._prepare_unified_analysis_data(
+                    df=df,
+                    chart_config=chart_config,
+                    forecast_results=forecast_results,
+                    simulation_results=simulation_results,
+                    prefer_last_table=True
+                )
+                # Force multi-line line chart for analysis phases
+                chart_config = dict(chart_config)
+                chart_config["title"] = chart_config.get("title", "Continuous Analysis: Historical → Forecast → Scenarios")
+                chart_config["chart_type"] = "line"
+                return self._create_unified_continuous_chart(analysis_data, chart_config)
+            elif chart_type == "bar":
+                self._create_bar_chart(df, x_col, y_col, title)
+            elif chart_type == "line":
+                self._create_line_chart(df, x_col, y_col, title)
+            elif chart_type == "pie":
+                self._create_pie_chart(df, x_col, y_col, title)
+            elif chart_type == "scatter":
+                self._create_scatter_chart(df, x_col, y_col, title)
+            elif chart_type == "histogram":
+                self._create_histogram(df, x_col, title)
+            else:
+                self._create_bar_chart(df, x_col, y_col, title)
+            
+            # Add validation warnings as subtitle if any
+            if validation_result and validation_result.get("warnings"):
+                warning_text = "; ".join(validation_result["warnings"][:2])  # Show max 2 warnings
+                plt.figtext(0.5, 0.02, f"Note: {warning_text}", ha='center', fontsize=8, style='italic', color='gray')
+            
+            # Convert to base64
+            buffer = BytesIO()
+            plt.savefig(buffer, format='png', dpi=300, bbox_inches='tight')
+            buffer.seek(0)
+            image_base64 = base64.b64encode(buffer.getvalue()).decode()
+            plt.close()
+            
+            return image_base64
+            
+        except Exception as e:
+            logger.error(f"Error creating visualization: {e}")
+            return None
+
+    def _prepare_unified_analysis_data(self, df: pd.DataFrame, chart_config: Dict[str, Any],
+                                       forecast_results: Dict[str, Any] = None,
+                                       simulation_results: Dict[str, Any] = None,
+                                       prefer_last_table: bool = True) -> Dict[str, Any]:
+        """Prepare a unified dataframe combining historical (descriptive), forecast (predictive), and scenarios (prescriptive).
+        - Descriptive (historical) uses the first numeric column by default; if prefer_last_table, use last numeric column.
+        - Predictive adds a 'Forecast' series appended after historical.
+        - Prescriptive adds one series per scenario (values or adjusted forecast by change_percent).
+        Returns a dict with dataframe, time_column, and column groups for plotting.
+        """
+        try:
+            work_df = df.copy()
+
+            # Identify time and value columns
+            candidate_time_cols = [
+                'date', 'created_at', 'updated_at', 'timestamp', 'time', 'period', 'month_name', 'month'
+            ]
+            time_col = None
+            for c in work_df.columns:
+                if c.lower() in candidate_time_cols:
+                    time_col = c
+                    break
+
+            if time_col is None and len(work_df.columns) > 0:
+                # Try to infer datetime
+                for c in work_df.columns:
+                    if pd.api.types.is_datetime64_any_dtype(work_df[c]):
+                        time_col = c
+                        break
+                # Fallback to first column as time label
+                if time_col is None:
+                    time_col = work_df.columns[0]
+
+            # Normalize month values if necessary
+            if time_col == 'month' and pd.api.types.is_numeric_dtype(work_df['month']):
+                work_df['month_name'] = work_df['month'].apply(lambda x: calendar.month_name[int(x)] if pd.notna(x) and 1 <= int(x) <= 12 else str(x))
+                time_col = 'month_name'
+
+            numeric_cols = work_df.select_dtypes(include=[np.number]).columns.tolist()
+            if not numeric_cols:
+                # Try to coerce any suitable columns
+                for c in work_df.columns:
+                    try:
+                        work_df[c] = pd.to_numeric(work_df[c])
+                    except Exception:
+                        pass
+                numeric_cols = work_df.select_dtypes(include=[np.number]).columns.tolist()
+
+            if not numeric_cols:
+                # Nothing to plot meaningfully
+                return {
+                    'dataframe': work_df,
+                    'time_column': time_col,
+                    'descriptive_columns': [],
+                    'predictive_columns': [],
+                    'prescriptive_columns': []
+                }
+
+            # Choose value column according to rule (first for descriptive-only, last when analysis present)
+            analysis_present = bool((forecast_results and 'forecasts' in forecast_results) or (simulation_results and 'scenarios' in simulation_results))
+            if analysis_present and prefer_last_table:
+                value_col = numeric_cols[-1]
+            else:
+                value_col = numeric_cols[0]
+
+            # Build historical series
+            hist_series = work_df[value_col].reset_index(drop=True)
+            # Time index
+            if time_col in work_df.columns:
+                time_series = pd.Series(work_df[time_col]).reset_index(drop=True)
+            else:
+                time_series = pd.Series(range(len(hist_series)))
+
+            unified = pd.DataFrame({
+                time_col if time_col else 'index': time_series,
+                f'Historical {value_col}': hist_series
+            })
+            time_key = time_col if time_col else 'index'
+
+            descriptive_cols = [f'Historical {value_col}']
+            predictive_cols = []
+            prescriptive_cols = []
+
+            # Append forecast series if available
+            if forecast_results and 'forecasts' in forecast_results and isinstance(forecast_results['forecasts'], list):
+                forecasts = forecast_results['forecasts']
+                # Build extended time index
+                hist_len = len(unified)
+                future_index = np.arange(hist_len, hist_len + len(forecasts))
+                future_time = future_index
+                if pd.api.types.is_datetime64_any_dtype(time_series):
+                    # Assume uniform frequency of 1 period
+                    last = pd.to_datetime(time_series.iloc[-1])
+                    future_time = [last + pd.Timedelta(days=i+1) for i in range(len(forecasts))]
+                elif time_key == 'month_name':
+                    # Increment months cyclically as labels
+                    last_month = time_series.iloc[-1]
+                    try:
+                        last_idx = list(calendar.month_name).index(str(last_month))
+                    except ValueError:
+                        last_idx = 1
+                    future_time = [calendar.month_name[((last_idx + i - 1) % 12) + 1] for i in range(1, len(forecasts) + 1)]
+
+                forecast_df = pd.DataFrame({
+                    time_key: future_time,
+                    'Forecast': forecasts
+                })
+                unified = pd.concat([unified, forecast_df], ignore_index=True)
+                predictive_cols.append('Forecast')
+
+            # Add scenarios if available
+            if simulation_results and 'scenarios' in simulation_results and isinstance(simulation_results['scenarios'], list):
+                scenarios = simulation_results['scenarios']
+                # Base line for adjustment: use Forecast if available, else extend historical last value
+                base_series = None
+                if 'Forecast' in unified.columns:
+                    base_series = unified['Forecast'].dropna().reset_index(drop=True)
+                else:
+                    base_val = unified[descriptive_cols[0]].dropna().iloc[-1] if len(unified[descriptive_cols[0]].dropna()) > 0 else 0
+                    base_series = pd.Series([base_val] * 12)
+
+                for i, sc in enumerate(scenarios[:5]):
+                    name = sc.get('name', f'Scenario {i+1}')
+                    line_name = f'Scenario: {name}'
+                    if 'values' in sc and isinstance(sc['values'], list) and len(sc['values']) > 0:
+                        values = sc['values']
+                        # Align with tail of unified (forecast horizon)
+                        scenario_len = len(values)
+                        # Ensure rows exist
+                        needed_rows = scenario_len - (len(unified) - len(hist_series))
+                        if needed_rows > 0:
+                            # pad time forward as numeric index
+                            add_time = list(range(len(unified), len(unified) + needed_rows))
+                            pad_df = pd.DataFrame({time_key: add_time})
+                            unified = pd.concat([unified, pad_df], ignore_index=True)
+                        # Place values at the end
+                        start_idx = len(unified) - scenario_len
+                        scenario_series = pd.Series([np.nan] * len(unified))
+                        scenario_series.iloc[start_idx:] = values
+                        unified[line_name] = scenario_series
+                    else:
+                        # Use change_percent to scale base_series
+                        change_pct = sc.get('change_percent')
+                        try:
+                            if change_pct is None and 'parameters' in sc:
+                                # Try percentage string like "10%" in parameters values
+                                for v in sc['parameters'].values():
+                                    if isinstance(v, str) and v.endswith('%'):
+                                        change_pct = float(v.replace('%', ''))
+                                        break
+                            change_pct = float(change_pct) if change_pct is not None else 0.0
+                        except Exception:
+                            change_pct = 0.0
+                        scenario_vals = base_series * (1 + change_pct / 100.0)
+                        # Append or align to the tail of unified
+                        scenario_series = pd.Series([np.nan] * len(unified))
+                        tail_len = len(scenario_vals)
+                        if tail_len > len(unified) - len(hist_series):
+                            needed_rows = tail_len - (len(unified) - len(hist_series))
+                            add_time = list(range(len(unified), len(unified) + needed_rows))
+                            pad_df = pd.DataFrame({time_key: add_time})
+                            unified = pd.concat([unified, pad_df], ignore_index=True)
+                            scenario_series = pd.Series([np.nan] * len(unified))
+                        start_idx = len(unified) - tail_len
+                        scenario_series.iloc[start_idx:] = scenario_vals.values
+                        unified[line_name] = scenario_series
+                    prescriptive_cols.append(line_name)
+
+            return {
+                'dataframe': unified,
+                'time_column': time_key,
+                'descriptive_columns': descriptive_cols,
+                'predictive_columns': predictive_cols,
+                'prescriptive_columns': prescriptive_cols
             }
-        
-        return summary
+        except Exception as e:
+            logger.error(f"Error preparing unified analysis data: {e}")
+            # Fall back to simple plot using original df
+            return {
+                'dataframe': df,
+                'time_column': chart_config.get('x_axis') if chart_config else (df.columns[0] if len(df.columns) else None),
+                'descriptive_columns': [chart_config.get('y_axis')] if chart_config and chart_config.get('y_axis') in df.columns else [],
+                'predictive_columns': [],
+                'prescriptive_columns': []
+            }
     
-    def _identify_patterns(self, df: pd.DataFrame) -> Dict:
-        """Identify data patterns and trends"""
-        patterns = {
-            'correlations': {},
-            'outliers': {},
-            'trends': {}
-        }
-        
-        # Correlation analysis for numeric columns
-        numeric_cols = df.select_dtypes(include=[np.number]).columns
-        if len(numeric_cols) > 1:
-            corr_matrix = df[numeric_cols].corr()
-            patterns['correlations'] = {
-                'strong_positive': [],
-                'strong_negative': []
+    def _create_bar_chart(self, df: pd.DataFrame, x_col: str, y_col: str, title: str):
+        if x_col and y_col and x_col in df.columns and y_col in df.columns:
+            plt.bar(df[x_col], df[y_col])
+            plt.xlabel(x_col)
+            plt.ylabel(y_col)
+        else:
+            # Auto-select columns
+            numeric_cols = df.select_dtypes(include=[np.number]).columns
+            if len(numeric_cols) > 0:
+                plt.bar(range(len(df)), df[numeric_cols[0]])
+                plt.ylabel(numeric_cols[0])
+        plt.title(title)
+        plt.xticks(rotation=45)
+    
+    def _create_line_chart(self, df: pd.DataFrame, x_col: str, y_col: str, title: str):
+        """Create a line chart"""
+        try:
+            plt.figure(figsize=(12, 8))
+            plt.plot(df[x_col], df[y_col], marker='o')
+            plt.title(title)
+            plt.xlabel(x_col)
+            plt.ylabel(y_col)
+            plt.grid(True, alpha=0.3)
+            plt.xticks(rotation=45)
+            plt.tight_layout()
+            
+            # Convert to base64
+            buffer = BytesIO()
+            plt.savefig(buffer, format='png', dpi=300, bbox_inches='tight')
+            buffer.seek(0)
+            image_base64 = base64.b64encode(buffer.getvalue()).decode()
+            plt.close()
+            
+            return image_base64
+            
+        except Exception as e:
+            logger.error(f"Error creating line chart: {e}")
+            return None
+
+    def _create_unified_continuous_chart(self, analysis_data: Dict[str, Any], chart_config: Dict[str, Any] = None) -> str:
+        """Create unified continuous chart from prepared analysis data"""
+        try:
+            plt.figure(figsize=(16, 10))
+            plt.style.use('seaborn-v0_8-darkgrid')
+            
+            df = analysis_data['dataframe']
+            time_col = analysis_data['time_column']
+            descriptive_cols = analysis_data['descriptive_columns']
+            predictive_cols = analysis_data['predictive_columns']
+            prescriptive_cols = analysis_data['prescriptive_columns']
+            
+            # Get time values
+            if time_col and time_col in df.columns:
+                time_values = df[time_col].values
+            else:
+                time_values = np.arange(len(df))
+            
+            # Color scheme
+            colors = {
+                'descriptive': '#2E86C1',      # Blue
+                'predictive': '#E74C3C',       # Red
+                'prescriptive': ['#F39C12', '#8E44AD', '#27AE60', '#E67E22', '#34495E']  # Various colors
             }
             
-            for i in range(len(corr_matrix.columns)):
-                for j in range(i+1, len(corr_matrix.columns)):
-                    corr_val = corr_matrix.iloc[i, j]
-                    if abs(corr_val) > 0.7:
-                        pair = f"{corr_matrix.columns[i]} vs {corr_matrix.columns[j]}"
-                        if corr_val > 0:
-                            patterns['correlations']['strong_positive'].append({
-                                'pair': pair,
-                                'correlation': float(corr_val)
-                            })
+            # Plot descriptive data (historical/actual)
+            for i, col in enumerate(descriptive_cols):
+                if col in df.columns:
+                    plt.plot(time_values, df[col], color=colors['descriptive'], linewidth=3,
+                            marker='o', markersize=6, label=f'Historical {col}', alpha=0.9, zorder=5)
+            
+            # Plot predictive data (forecasted)
+            for i, col in enumerate(predictive_cols):
+                if col in df.columns:
+                    plt.plot(time_values, df[col], color=colors['predictive'], linewidth=3,
+                            linestyle='--', marker='s', markersize=5, label=f'Forecast {col}',
+                            alpha=0.9, zorder=4)
+            
+            # Plot prescriptive data (scenarios/simulations)
+            for i, col in enumerate(prescriptive_cols):
+                if col in df.columns:
+                    color = colors['prescriptive'][i % len(colors['prescriptive'])]
+                    # Calculate percent change from descriptive if available
+                    if descriptive_cols and descriptive_cols[0] in df.columns:
+                        base_values = df[descriptive_cols[0]].dropna()
+                        scenario_values = df[col].dropna()
+                        if len(base_values) > 0 and len(scenario_values) > 0:
+                            change_percent = ((scenario_values.iloc[-1] - base_values.iloc[-1]) / 
+                                           base_values.iloc[-1] * 100)
+                            label = f"{col} ({change_percent:+.1f}%)"
                         else:
-                            patterns['correlations']['strong_negative'].append({
-                                'pair': pair,
-                                'correlation': float(corr_val)
+                            label = col
+                    else:
+                        label = col
+                    
+                    plt.plot(time_values, df[col], color=color, linewidth=2.5,
+                            linestyle='-.', marker='^', markersize=5, label=label,
+                            alpha=0.8, zorder=3)
+            
+            # Enhanced formatting
+            title = chart_config.get('title', 'Continuous Analysis: Descriptive → Predictive → Prescriptive') if chart_config else 'Continuous Analysis'
+            plt.title(f'{title}', fontsize=16, fontweight='bold', pad=20)
+            
+            x_label = time_col if time_col else 'Time Period'
+            y_label = descriptive_cols[0] if descriptive_cols else 'Value'
+            plt.xlabel(x_label, fontsize=14, fontweight='semibold')
+            plt.ylabel(y_label, fontsize=14, fontweight='semibold')
+            
+            # Add phase separators
+            self._add_phase_separators(time_values, df, descriptive_cols, predictive_cols, prescriptive_cols)
+            
+            # Grid and legend
+            plt.grid(True, alpha=0.3, linestyle='-', linewidth=0.5)
+            plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=11, framealpha=0.9)
+            plt.tight_layout()
+            
+            # Convert to base64
+            buffer = BytesIO()
+            plt.savefig(buffer, format='png', dpi=300, bbox_inches='tight', facecolor='white')
+            buffer.seek(0)
+            image_base64 = base64.b64encode(buffer.getvalue()).decode()
+            plt.close()
+            
+            return image_base64
+            
+        except Exception as e:
+            logger.error(f"Error creating unified continuous chart: {e}")
+            return None
+
+    def _add_phase_separators(self, time_values, df, descriptive_cols, predictive_cols, prescriptive_cols):
+        """Add visual separators between analysis phases"""
+        y_min, y_max = plt.ylim()
+        y_range = y_max - y_min
+        
+        # Historical-Forecast separator
+        if descriptive_cols and predictive_cols:
+            desc_mask = pd.notna(df[descriptive_cols[0]])
+            if desc_mask.any():
+                last_desc_idx = desc_mask[::-1].idxmax()
+                sep_x = time_values[last_desc_idx]
+                
+                plt.axvline(x=sep_x, color='gray', linestyle='--', alpha=0.6, linewidth=1.5, zorder=0)
+                plt.text(sep_x, y_max - 0.05 * y_range, 'Forecast Begin', 
+                        rotation=90, verticalalignment='top', fontsize=10, alpha=0.8,
+                        bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.8))
+        
+        # Forecast-Scenario separator
+        if predictive_cols and prescriptive_cols:
+            pred_mask = pd.notna(df[predictive_cols[0]])
+            if pred_mask.any():
+                last_pred_idx = pred_mask[::-1].idxmax()
+                sep_x = time_values[last_pred_idx]
+                
+                plt.axvline(x=sep_x, color='gray', linestyle=':', alpha=0.6, linewidth=1.5, zorder=0)
+                plt.text(sep_x, y_max - 0.15 * y_range, 'Scenarios', 
+                        rotation=90, verticalalignment='top', fontsize=10, alpha=0.8,
+                        bbox=dict(boxstyle="round,pad=0.3", facecolor='white', alpha=0.8))
+
+    def _create_multi_phase_continuous_chart(self, df: pd.DataFrame, chart_config: Dict[str, Any],
+                                           forecast_results: Dict[str, Any] = None, 
+                                           simulation_results: Dict[str, Any] = None) -> str:
+        """Create continuous chart from separate analysis results"""
+        try:
+            plt.figure(figsize=(16, 10))
+            plt.style.use('seaborn-v0_8-darkgrid')
+            
+            # Build unified dataset for continuous visualization
+            columns = df.columns.tolist()
+            x_col = chart_config.get("x_axis") if chart_config else columns[0]
+            y_col = chart_config.get("y_axis") if chart_config else (columns[1] if len(columns) > 1 else columns[0])
+            
+            # Extract historical data
+            if x_col in df.columns and y_col in df.columns:
+                historical_x = df[x_col].values
+                historical_y = df[y_col].values
+            else:
+                historical_x = np.arange(len(df))
+                historical_y = df.iloc[:, 0].values if len(df.columns) > 0 else np.array([])
+            
+            # Sort historical data by x-axis
+            if len(historical_x) > 1:
+                sort_idx = np.argsort(historical_x)
+                historical_x = historical_x[sort_idx]
+                historical_y = historical_y[sort_idx]
+            
+            # Plot historical data
+            plt.plot(historical_x, historical_y, color='#2E86C1', linewidth=3, marker='o',
+                    markersize=6, label='Historical Data', alpha=0.9, zorder=5)
+            
+            # Add forecast data if available
+            if forecast_results and "forecasts" in forecast_results and not forecast_results.get("error"):
+                forecasts = np.array(forecast_results["forecasts"])
+                if len(forecasts) > 0:
+                    last_historical_x = historical_x[-1]
+                    forecast_x = np.arange(last_historical_x + 1, last_historical_x + len(forecasts) + 1)
+                    
+                    # Plot forecast line with connection to historical
+                    plt.plot([historical_x[-1], forecast_x[0]], 
+                            [historical_y[-1], forecasts[0]], 
+                            color='#E74C3C', linewidth=3, linestyle='--', alpha=0.9, zorder=4)
+                    
+                    plt.plot(forecast_x, forecasts, color='#E74C3C', linewidth=3, linestyle='--',
+                            marker='s', markersize=5, label='Forecast', alpha=0.9, zorder=4)
+                    
+                    # Add confidence intervals if available
+                    if "lower_bound" in forecast_results and "upper_bound" in forecast_results:
+                        lower_bound = np.array(forecast_results["lower_bound"])
+                        upper_bound = np.array(forecast_results["upper_bound"])
+                        plt.fill_between(forecast_x, lower_bound, upper_bound,
+                                       color='#E74C3C', alpha=0.2, label='95% Confidence')
+            
+            # Add simulation scenarios if available
+            if simulation_results and "scenarios" in simulation_results and not simulation_results.get("error"):
+                scenarios = simulation_results["scenarios"]
+                colors = ['#F39C12', '#8E44AD', '#27AE60', '#E67E22', '#34495E']
+                
+                for i, scenario in enumerate(scenarios[:5]):  # Show up to 5 scenarios
+                    if "values" in scenario and len(scenario["values"]) > 0:
+                        values = np.array(scenario["values"])
+                        scenario_x = np.arange(historical_x[-1], historical_x[-1] + len(values))
+                        
+                        # Calculate percentage change from baseline
+                        change_percent = ((values[-1] - historical_y[-1]) / historical_y[-1] * 100 
+                                        if len(historical_y) > 0 else 0)
+                        
+                        # Determine line style based on performance
+                        color = colors[i % len(colors)]
+                        if change_percent > 0:
+                            linestyle = '-.'
+                            alpha = 0.9
+                        else:
+                            linestyle = ':'
+                            alpha = 0.7
+                        
+                        plt.plot(scenario_x, values, color=color, linewidth=2.5, linestyle=linestyle,
+                                marker='^', markersize=5, alpha=alpha,
+                                label=f"{scenario['name']} ({change_percent:+.1f}%)", zorder=3)
+            
+            # Enhanced formatting
+            title = chart_config.get('title', 'Continuous Analysis: Historical → Forecast → Scenarios')
+            plt.title(title, fontsize=16, fontweight='bold', pad=20)
+            plt.xlabel(x_col, fontsize=14, fontweight='semibold')
+            plt.ylabel(y_col, fontsize=14, fontweight='semibold')
+            
+            # Grid and legend
+            plt.grid(True, alpha=0.3, linestyle='-', linewidth=0.5)
+            plt.legend(bbox_to_anchor=(1.05, 1), loc='upper left', fontsize=11, framealpha=0.9)
+            plt.tight_layout()
+            
+            # Convert to base64
+            buffer = BytesIO()
+            plt.savefig(buffer, format='png', dpi=300, bbox_inches='tight', facecolor='white')
+            buffer.seek(0)
+            image_base64 = base64.b64encode(buffer.getvalue()).decode()
+            plt.close()
+            
+            return image_base64
+            
+        except Exception as e:
+            logger.error(f"Error creating multi-phase continuous chart: {e}")
+            return None
+
+        if x_col and y_col and x_col in df.columns and y_col in df.columns:
+            plt.plot(df[x_col], df[y_col], marker='o')
+            plt.xlabel(x_col)
+            plt.ylabel(y_col)
+        else:
+            numeric_cols = df.select_dtypes(include=[np.number]).columns
+            if len(numeric_cols) > 0:
+                plt.plot(df[numeric_cols[0]], marker='o')
+                plt.ylabel(numeric_cols[0])
+        plt.title(title)
+        plt.xticks(rotation=45)
+    
+    def _create_pie_chart(self, df: pd.DataFrame, x_col: str, y_col: str, title: str):
+        if x_col and y_col and x_col in df.columns and y_col in df.columns:
+            plt.pie(df[y_col], labels=df[x_col], autopct='%1.1f%%')
+        else:
+            numeric_cols = df.select_dtypes(include=[np.number]).columns
+            if len(numeric_cols) > 0:
+                plt.pie(df[numeric_cols[0]], autopct='%1.1f%%')
+        plt.title(title)
+    
+    def _create_scatter_chart(self, df: pd.DataFrame, x_col: str, y_col: str, title: str):
+        if x_col and y_col and x_col in df.columns and y_col in df.columns:
+            plt.scatter(df[x_col], df[y_col])
+            plt.xlabel(x_col)
+            plt.ylabel(y_col)
+        else:
+            numeric_cols = df.select_dtypes(include=[np.number]).columns
+            if len(numeric_cols) >= 2:
+                plt.scatter(df[numeric_cols[0]], df[numeric_cols[1]])
+                plt.xlabel(numeric_cols[0])
+                plt.ylabel(numeric_cols[1])
+        plt.title(title)
+    
+    def _create_histogram(self, df: pd.DataFrame, x_col: str, title: str):
+        if x_col and x_col in df.columns:
+            plt.hist(df[x_col], bins=20)
+            plt.xlabel(x_col)
+        else:
+            numeric_cols = df.select_dtypes(include=[np.number]).columns
+            if len(numeric_cols) > 0:
+                plt.hist(df[numeric_cols[0]], bins=20)
+                plt.xlabel(numeric_cols[0])
+        plt.title(title)
+        plt.ylabel('Frequency')
+    
+    def _create_continuous_analysis_chart(self, df: pd.DataFrame, x_col: str, y_col: str, title: str, 
+                                        forecast_results: Dict[str, Any] = None, simulation_results: Dict[str, Any] = None):
+        """Deprecated: Prefer unified multi-line chart. Kept for backward compatibility."""
+        return self._create_line_chart(df, x_col, y_col, title)
+        
+
+# Predictive Analysis Agent
+class PredictiveAnalysisAgent:
+    def __init__(self, llm: ChatGroq):
+        self.llm = llm
+        self.predictive_prompt = PromptTemplates.get_predictive_analysis_prompt()
+    
+    def generate_forecast_config(self, user_input: str, query_data: List[Dict], columns: List[str], context: str = "") -> Dict[str, Any]:
+        """Generate forecasting configuration based on historical data"""
+        if not query_data or not columns:
+            return {"error": "No data available for predictive analysis"}
+        
+        # Fallback configuration
+        fallback_config = {
+            "model_type": "linear",
+            "forecast_periods": 12,
+            "time_column": None,
+            "target_column": columns[0] if columns else None,
+            "confidence_level": 0.95,
+            "description": "Simple linear forecast based on available data"
+        }
+        
+        try:
+            # Heuristic: extract explicit forecast horizon from user_input (e.g., "next 3 months")
+            horizon = None
+            try:
+                import re
+                m = re.search(r"next\s+(\d{1,3})\s*(month|months|m)\b", user_input, re.IGNORECASE)
+                if m:
+                    horizon = int(m.group(1))
+            except Exception:
+                horizon = None
+
+            prompt = self.predictive_prompt.format(
+                user_input=user_input,
+                query_data=str(query_data[:10]),  # First 10 rows for analysis
+                columns=str(columns),
+                analysis_context=context
+            )
+            
+            response = self.llm.invoke(prompt)
+            response_content = response.content.strip()
+            
+            # Parse JSON response with fallback
+            if "```json" in response_content:
+                import re
+                json_match = re.search(r'```json\s*(.*?)\s*```', response_content, re.DOTALL)
+                if json_match:
+                    response_content = json_match.group(1).strip()
+            
+            config = json.loads(response_content)
+            
+            # Validate and set defaults
+            config.setdefault("model_type", fallback_config["model_type"])
+            # Override with horizon from user_input when present
+            if horizon is not None:
+                config["forecast_periods"] = horizon
+            else:
+                config.setdefault("forecast_periods", fallback_config["forecast_periods"]) 
+            config.setdefault("confidence_level", fallback_config["confidence_level"])
+            
+            return config
+            
+        except Exception as e:
+            logger.error(f"Error generating forecast config: {e}")
+            return fallback_config
+    
+    def create_forecast(self, query_data: List[Dict], forecast_config: Dict[str, Any]) -> Dict[str, Any]:
+        """Create forecast based on configuration"""
+        try:
+            if not query_data:
+                return {"error": "No data for forecasting"}
+            
+            df = pd.DataFrame(query_data)
+            model_type = forecast_config.get("model_type", "linear")
+            target_col = forecast_config.get("target_column")
+            time_col = forecast_config.get("time_column")
+            periods = int(forecast_config.get("forecast_periods", 12))
+            
+            if target_col not in df.columns:
+                # Use first numeric column
+                numeric_cols = df.select_dtypes(include=[np.number]).columns
+                target_col = numeric_cols[0] if len(numeric_cols) > 0 else df.columns[0]
+            
+            if model_type == "arima" and STATSMODELS_AVAILABLE:
+                return self._create_arima_forecast(df, target_col, periods)
+            elif model_type == "prophet" and PROPHET_AVAILABLE:
+                return self._create_prophet_forecast(df, target_col, time_col, periods)
+            elif model_type == "exponential_smoothing" and STATSMODELS_AVAILABLE:
+                return self._create_exponential_smoothing_forecast(df, target_col, periods)
+            else:
+                return self._create_linear_forecast(df, target_col, periods)
+                
+        except Exception as e:
+            logger.error(f"Error creating forecast: {e}")
+            return {"error": f"Forecasting failed: {str(e)}"}
+    
+    def _create_linear_forecast(self, df: pd.DataFrame, target_col: str, periods: int) -> Dict[str, Any]:
+        """Create linear regression forecast"""
+        try:
+            values = df[target_col].values
+            X = np.arange(len(values)).reshape(-1, 1)
+            y = values
+            
+            model = LinearRegression()
+            model.fit(X, y)
+            
+            # Generate forecasts
+            future_X = np.arange(len(values), len(values) + periods).reshape(-1, 1)
+            forecasts = model.predict(future_X)
+            
+            # Calculate basic confidence intervals (simplified)
+            residuals = y - model.predict(X)
+            mse = np.mean(residuals**2)
+            std_error = np.sqrt(mse)
+            confidence_interval = 1.96 * std_error  # 95% CI
+            
+            return {
+                "model": "Linear Regression",
+                "forecasts": forecasts.tolist(),
+                "confidence_lower": (forecasts - confidence_interval).tolist(),
+                "confidence_upper": (forecasts + confidence_interval).tolist(),
+                "historical_values": values.tolist(),
+                "mae": mean_absolute_error(y, model.predict(X)),
+                "mse": mse,
+                "periods": periods
+            }
+        except Exception as e:
+            return {"error": f"Linear forecast failed: {str(e)}"}
+    
+    def _create_arima_forecast(self, df: pd.DataFrame, target_col: str, periods: int) -> Dict[str, Any]:
+        """Create ARIMA forecast"""
+        try:
+            from statsmodels.tsa.arima.model import ARIMA
+            values = df[target_col].values
+            
+            # Fit ARIMA model (auto-detect parameters)
+            model = ARIMA(values, order=(1, 1, 1))
+            fitted_model = model.fit()
+            
+            # Generate forecasts
+            forecast_result = fitted_model.forecast(steps=periods, alpha=0.05)
+            forecasts = forecast_result
+            
+            return {
+                "model": "ARIMA(1,1,1)",
+                "forecasts": forecasts.tolist(),
+                "historical_values": values.tolist(),
+                "periods": periods,
+                "aic": fitted_model.aic,
+                "bic": fitted_model.bic
+            }
+        except Exception as e:
+            return {"error": f"ARIMA forecast failed: {str(e)}"}
+    
+    def _create_prophet_forecast(self, df: pd.DataFrame, target_col: str, time_col: str, periods: int) -> Dict[str, Any]:
+        """Create Prophet forecast"""
+        try:
+            from prophet import Prophet
+            
+            # Prepare data for Prophet
+            prophet_df = pd.DataFrame()
+            if time_col and time_col in df.columns:
+                prophet_df['ds'] = pd.to_datetime(df[time_col])
+            else:
+                # Create synthetic time index
+                prophet_df['ds'] = pd.date_range(start='2020-01-01', periods=len(df), freq='D')
+            
+            prophet_df['y'] = df[target_col].values
+            
+            # Fit Prophet model
+            model = Prophet()
+            model.fit(prophet_df)
+            
+            # Generate future dates
+            future = model.make_future_dataframe(periods=periods)
+            forecast = model.predict(future)
+            
+            return {
+                "model": "Prophet",
+                "forecasts": forecast['yhat'].tail(periods).tolist(),
+                "confidence_lower": forecast['yhat_lower'].tail(periods).tolist(),
+                "confidence_upper": forecast['yhat_upper'].tail(periods).tolist(),
+                "historical_values": df[target_col].tolist(),
+                "periods": periods,
+                "trend": forecast['trend'].tail(periods).tolist()
+            }
+        except Exception as e:
+            return {"error": f"Prophet forecast failed: {str(e)}"}
+    
+    def _create_exponential_smoothing_forecast(self, df: pd.DataFrame, target_col: str, periods: int) -> Dict[str, Any]:
+        """Create Exponential Smoothing forecast"""
+        try:
+            from statsmodels.tsa.holtwinters import ExponentialSmoothing
+            values = df[target_col].values
+            
+            # Fit Exponential Smoothing model
+            model = ExponentialSmoothing(values, trend='add', seasonal=None)
+            fitted_model = model.fit()
+            
+            # Generate forecasts
+            forecasts = fitted_model.forecast(periods)
+            
+            return {
+                "model": "Exponential Smoothing",
+                "forecasts": forecasts.tolist(),
+                "historical_values": values.tolist(),
+                "periods": periods
+            }
+        except Exception as e:
+            return {"error": f"Exponential Smoothing forecast failed: {str(e)}"}
+
+# Prescriptive Analysis Agent
+class PrescriptiveAnalysisAgent:
+    def __init__(self, llm: ChatGroq):
+        self.llm = llm
+        self.prescriptive_prompt = PromptTemplates.get_prescriptive_analysis_prompt()
+    
+    def generate_simulation_config(self, user_input: str, query_data: List[Dict], columns: List[str], context: str = "") -> Dict[str, Any]:
+        """Generate simulation configuration based on current data"""
+        if not query_data or not columns:
+            return {"error": "No data available for prescriptive analysis"}
+        
+        # Fallback configuration
+        fallback_config = {
+            "simulation_type": "what_if",
+            "independent_variables": [columns[0]] if columns else [],
+            "dependent_variable": columns[1] if len(columns) > 1 else columns[0] if columns else None,
+            "scenarios": [
+                {
+                    "name": "Baseline",
+                    "parameters": {},
+                    "description": "Current state without changes"
+                }
+            ],
+            "description": "Basic what-if simulation based on available data"
+        }
+        
+        try:
+            # Heuristic: extract percentage from user_input (e.g., "simulate 10%", "+10%", "increase 10%")
+            percent = None
+            try:
+                import re
+                m = re.search(r"(simulate|increase|decrease|change|\+|-)\s*(\d{1,3})\s*%", user_input, re.IGNORECASE)
+                if m:
+                    sign = m.group(1)
+                    val = int(m.group(2))
+                    if sign.strip().lower() == 'decrease' or sign.strip() == '-':
+                        val = -val
+                    percent = val
+            except Exception:
+                percent = None
+
+            prompt = self.prescriptive_prompt.format(
+                user_input=user_input,
+                query_data=str(query_data[:10]),  # First 10 rows for analysis
+                columns=str(columns),
+                descriptive_context=context
+            )
+            
+            response = self.llm.invoke(prompt)
+            response_content = response.content.strip()
+            
+            # Parse JSON response with fallback
+            if "```json" in response_content:
+                import re
+                json_match = re.search(r'```json\s*(.*?)\s*```', response_content, re.DOTALL)
+                if json_match:
+                    response_content = json_match.group(1).strip()
+            
+            config = json.loads(response_content)
+            
+            # Validate and set defaults
+            config.setdefault("simulation_type", fallback_config["simulation_type"])
+            # Prefer a sensible dependent variable name
+            dv = config.get("dependent_variable")
+            if not dv:
+                # pick first column that looks like a total/count/amount, else first column
+                candidates = [c for c in columns if any(k in c.lower() for k in ["total", "count", "amount", "revenue", "value"]) ]
+                dv = candidates[0] if candidates else columns[0]
+                config["dependent_variable"] = dv
+
+            config.setdefault("independent_variables", fallback_config["independent_variables"])            
+            config.setdefault("scenarios", fallback_config["scenarios"])            
+
+            # If a percent was requested in prompt, ensure a scenario exists for it
+            if percent is not None:
+                label = f"{percent:+d}% Simulation"
+                scenario = {
+                    "name": label,
+                    "parameters": {},
+                    "change_percent": percent,
+                    "description": f"Apply a {percent:+d}% change to {dv}"
+                }
+                # Prepend the scenario so it appears prominently
+                config["scenarios"] = [scenario] + config.get("scenarios", [])
+            
+            return config
+            
+        except Exception as e:
+            logger.error(f"Error generating simulation config: {e}")
+            return fallback_config
+    
+    def run_simulation(self, query_data: List[Dict], simulation_config: Dict[str, Any]) -> Dict[str, Any]:
+        """Run simulation based on configuration"""
+        try:
+            if not query_data:
+                return {"error": "No data for simulation"}
+            
+            df = pd.DataFrame(query_data)
+            simulation_type = simulation_config.get("simulation_type", "what_if")
+            independent_vars = simulation_config.get("independent_variables", [])
+            dependent_var = simulation_config.get("dependent_variable")
+            scenarios = simulation_config.get("scenarios", [])
+            
+            if simulation_type == "what_if":
+                return self._run_what_if_simulation(df, independent_vars, dependent_var, scenarios)
+            elif simulation_type == "sensitivity":
+                return self._run_sensitivity_analysis(df, independent_vars, dependent_var)
+            elif simulation_type == "scenario":
+                return self._run_scenario_analysis(df, independent_vars, dependent_var, scenarios)
+            else:
+                return self._run_what_if_simulation(df, independent_vars, dependent_var, scenarios)
+                
+        except Exception as e:
+            logger.error(f"Error running simulation: {e}")
+            return {"error": f"Simulation failed: {str(e)}"}
+    
+    def _run_what_if_simulation(self, df: pd.DataFrame, independent_vars: List[str], dependent_var: str, scenarios: List[Dict]) -> Dict[str, Any]:
+        """Run what-if simulation"""
+        try:
+            results = {
+                "simulation_type": "What-If Analysis",
+                "scenarios": [],
+                "baseline": {}
+            }
+            
+            # Calculate baseline
+            if dependent_var and dependent_var in df.columns:
+                df[dependent_var] = pd.to_numeric(df[dependent_var], errors='coerce')
+                
+                baseline_value = df[dependent_var].mean()
+                results["baseline"] = {
+                    "scenario": "Current State",
+                    "value": baseline_value,
+                    "description": f"Current average {dependent_var}"
+                }
+            
+            # Run scenarios
+            for scenario in scenarios:
+                scenario_name = scenario.get("name", "Scenario")
+                parameters = scenario.get("parameters", {})
+                change_percent = scenario.get("change_percent")
+                
+                # Create modified dataset
+                modified_df = df.copy()
+                # If explicit column parameters were given, apply them
+                if parameters:
+                    for param, value in parameters.items():
+                        if param in modified_df.columns:
+                            if isinstance(value, str) and '%' in value:
+                                percent_change = float(value.replace('%', '')) / 100
+                                modified_df[param] = modified_df[param] * (1 + percent_change)
+                            else:
+                                try:
+                                    modified_df[param] = float(value)
+                                except Exception:
+                                    pass
+                # Otherwise, if a change_percent is given, apply it directly to dependent variable series for per-period values
+                elif change_percent is not None and dependent_var in modified_df.columns:
+                    try:
+                        pct = float(change_percent)
+                    except Exception:
+                        pct = 0.0
+                    modified_df[dependent_var] = modified_df[dependent_var] * (1 + pct / 100.0)
+                
+                # Calculate impact on dependent variable
+                if dependent_var and dependent_var in modified_df.columns:
+                    new_value = modified_df[dependent_var].mean()
+                    change = new_value - baseline_value
+                    change_percent = (change / baseline_value * 100) if baseline_value != 0 else 0
+                    
+                    scenario_entry = {
+                        "name": scenario_name,
+                        "parameters": parameters,
+                        "result": new_value,
+                        "change": change,
+                        "change_percent": change_percent,
+                        "description": scenario.get("description", "")
+                    }
+                    # Provide per-period values for plotting a line if we changed the dependent series
+                    if dependent_var in modified_df.columns:
+                        scenario_entry["values"] = modified_df[dependent_var].tolist()
+                    results["scenarios"].append(scenario_entry)
+            
+            return results
+            
+        except Exception as e:
+            return {"error": f"What-if simulation failed: {str(e)}"}
+    
+    def _run_sensitivity_analysis(self, df: pd.DataFrame, independent_vars: List[str], dependent_var: str) -> Dict[str, Any]:
+        """Run sensitivity analysis"""
+        try:
+            results = {
+                "simulation_type": "Sensitivity Analysis",
+                "variables": [],
+                "correlations": {}
+            }
+            
+            if dependent_var and dependent_var in df.columns:
+                for var in independent_vars:
+                    if var in df.columns:
+                        # Calculate correlation
+                        correlation = df[var].corr(df[dependent_var])
+                        
+                        # Test different values (+-10%, +-20%)
+                        test_values = [-20, -10, 10, 20]  # percentage changes
+                        sensitivity_results = []
+                        
+                        baseline = df[dependent_var].mean()
+                        
+                        for change_percent in test_values:
+                            modified_df = df.copy()
+                            modified_df[var] = modified_df[var] * (1 + change_percent/100)
+                            new_dependent = modified_df[dependent_var].mean()
+                            impact = new_dependent - baseline
+                            
+                            sensitivity_results.append({
+                                "change_percent": change_percent,
+                                "impact": impact,
+                                "new_value": new_dependent
                             })
-        
-        return patterns
-    
-    def _generate_insights(self, df: pd.DataFrame, schema: Dict) -> List[str]:
-        """Generate business insights"""
-        insights = []
-        
-        # Data volume insight
-        row_count = len(df)
-        col_count = len(df.columns)
-        insights.append(f"Dataset contains {row_count} records across {col_count} dimensions")
-        
-        # Missing data insight
-        missing_pct = (df.isnull().sum() / len(df) * 100)
-        high_missing = missing_pct[missing_pct > 10]
-        if len(high_missing) > 0:
-            insights.append(f"Data quality concern: {len(high_missing)} columns have >10% missing values")
-        else:
-            insights.append("Excellent data completeness with minimal missing values")
-        
-        # Business-specific insights for transaction data
-        if 'transactiontype' in df.columns or 'TransactionType' in df.columns:
-            type_col = 'transactiontype' if 'transactiontype' in df.columns else 'TransactionType'
-            type_dist = df[type_col].value_counts()
-            most_common = type_dist.index[0] if len(type_dist) > 0 else 'Unknown'
-            insights.append(f"Most frequent transaction type: '{most_common}' ({type_dist.iloc[0]} occurrences)")
+                        
+                        results["variables"].append({
+                            "variable": var,
+                            "correlation": correlation,
+                            "sensitivity": sensitivity_results
+                        })
+                        
+                        results["correlations"][var] = correlation
             
-            if len(type_dist) > 1:
-                insights.append(f"Transaction diversity: {len(type_dist)} different transaction types identified")
-        
-        # Amount analysis if present
-        amount_cols = [col for col in df.columns if 'amount' in col.lower()]
-        if amount_cols:
-            amount_col = amount_cols[0]
-            if df[amount_col].dtype in ['int64', 'float64']:
-                avg_amount = df[amount_col].mean()
-                max_amount = df[amount_col].max()
-                min_amount = df[amount_col].min()
-                insights.append(f"Transaction amounts range from ${min_amount:.2f} to ${max_amount:.2f} (avg: ${avg_amount:.2f})")
-                
-                # High value transaction insight
-                high_value_threshold = df[amount_col].quantile(0.9)
-                high_value_count = (df[amount_col] > high_value_threshold).sum()
-                if high_value_count > 0:
-                    insights.append(f"High-value transactions (>${high_value_threshold:.2f}+): {high_value_count} detected")
-        
-        # Status analysis
-        status_cols = [col for col in df.columns if 'status' in col.lower()]
-        if status_cols:
-            status_col = status_cols[0]
-            status_dist = df[status_col].value_counts()
-            if 'Success' in status_dist.index or 'success' in status_dist.index:
-                success_key = 'Success' if 'Success' in status_dist.index else 'success'
-                success_rate = (status_dist.get(success_key, 0) / len(df)) * 100
-                insights.append(f"Transaction success rate: {success_rate:.1f}%")
-                
-                if success_rate < 90:
-                    insights.append("Below-optimal success rate detected - investigate failed transactions")
-        
-        # Fraud analysis
-        fraud_cols = [col for col in df.columns if 'fraud' in col.lower()]
-        if fraud_cols:
-            fraud_col = fraud_cols[0]
-            if df[fraud_col].dtype == 'object':
-                fraud_count = (df[fraud_col].str.lower() == 'true').sum()
-                fraud_rate = (fraud_count / len(df)) * 100
-                if fraud_rate > 0:
-                    insights.append(f"Fraud detection: {fraud_count} suspicious transactions identified ({fraud_rate:.1f}% rate)")
-                else:
-                    insights.append("No fraudulent transactions detected in current dataset")
-        
-        # Device analysis
-        device_cols = [col for col in df.columns if 'device' in col.lower()]
-        if device_cols:
-            device_col = device_cols[0]
-            device_dist = df[device_col].value_counts()
-            most_used_device = device_dist.index[0] if len(device_dist) > 0 else 'Unknown'
-            insights.append(f"Primary transaction device: '{most_used_device}' ({device_dist.iloc[0]} transactions)")
-        
-        # Performance insights
-        latency_cols = [col for col in df.columns if 'latency' in col.lower()]
-        if latency_cols:
-            latency_col = latency_cols[0]
-            if df[latency_col].dtype in ['int64', 'float64']:
-                avg_latency = df[latency_col].mean()
-                max_latency = df[latency_col].max()
-                if avg_latency > 100:
-                    insights.append(f"Performance concern: Average latency {avg_latency:.1f}ms (max: {max_latency:.1f}ms)")
-                else:
-                    insights.append(f"Good performance: Average latency {avg_latency:.1f}ms")
-        
-        # Categorical distribution insights
-        for col in df.select_dtypes(include=['object']).columns:
-            if col.lower() not in ['transactiontype', 'status', 'fraud', 'device']:  # Skip already analyzed
-                unique_pct = df[col].nunique() / len(df) * 100
-                if unique_pct < 5:  # Low cardinality
-                    top_value = df[col].value_counts().iloc[0]
-                    top_pct = top_value / len(df) * 100
-                    insights.append(f"'{col}' shows high concentration: {top_pct:.1f}% in dominant category")
-        
-        # Numeric insights
-        for col in df.select_dtypes(include=[np.number]).columns:
-            if col.lower() not in ['amount', 'latency']:  # Skip already analyzed
-                if df[col].std() > 0:
-                    cv = df[col].std() / df[col].mean() * 100 if df[col].mean() != 0 else 0
-                    if cv > 100:
-                        insights.append(f"'{col}' shows high variability (CV: {cv:.1f}%) - investigate outliers")
-        
-        # Time-based insights if timestamp available
-        timestamp_cols = [col for col in df.columns if 'time' in col.lower() or 'date' in col.lower()]
-        if timestamp_cols:
-            insights.append("Temporal data available - time-series analysis recommended")
-        
-        return insights[:10]  # Limit to top 10 most relevant insights
-    
-    def _generate_recommendations(self, df: pd.DataFrame, schema: Dict) -> List[Dict]:
-        """Generate actionable recommendations"""
-        recommendations = []
-        
-        # Data quality recommendations
-        missing_data = df.isnull().sum()
-        if missing_data.sum() > 0:
-            recommendations.append({
-                'category': 'Data Quality',
-                'priority': 'High',
-                'action': 'Implement data validation and cleansing procedures',
-                'details': f"Address missing values in {missing_data[missing_data > 0].to_dict()}",
-                'timeline': 'Immediate'
-            })
-        
-        # Performance recommendations
-        if len(df) > 1000:
-            recommendations.append({
-                'category': 'Performance',
-                'priority': 'Medium',
-                'action': 'Consider data indexing and query optimization',
-                'details': 'Large dataset detected - optimize database queries for better performance',
-                'timeline': 'Within 2 weeks'
-            })
-        
-        # Analysis recommendations
-        numeric_cols = df.select_dtypes(include=[np.number]).columns
-        if len(numeric_cols) > 2:
-            recommendations.append({
-                'category': 'Analysis',
-                'priority': 'Medium',
-                'action': 'Conduct deeper statistical analysis',
-                'details': 'Multiple numeric variables available for advanced analytics',
-                'timeline': 'Within 1 week'
-            })
-        
-        return recommendations
-    
-    def _generate_text_summary(self, analysis: Dict, table_name: str) -> str:
-        """Generate comprehensive text summary of the analysis"""
-        summary_parts = []
-        
-        # Header
-        summary_parts.append(f"📊 BUSINESS INTELLIGENCE SUMMARY FOR {table_name.upper()}")
-        summary_parts.append("=" * 60)
-        
-        # Executive Overview
-        schema = analysis.get('schema', {})
-        quality = analysis.get('data_quality', {})
-        
-        summary_parts.append("\n🎯 EXECUTIVE OVERVIEW:")
-        summary_parts.append(f"• Dataset contains {schema.get('row_count', 0)} transaction records")
-        summary_parts.append(f"• Data spans {len(schema.get('columns', []))} dimensions")
-        summary_parts.append(f"• Overall data quality score: {self._calculate_data_quality_score(analysis)}/100")
-        
-        # Data Quality Assessment
-        summary_parts.append("\n📋 DATA QUALITY ASSESSMENT:")
-        if quality.get('missing_values'):
-            missing_total = sum(quality['missing_values'].values())
-            if missing_total == 0:
-                summary_parts.append("• ✅ No missing values detected - excellent data completeness")
-            else:
-                missing_cols = [k for k, v in quality['missing_values'].items() if v > 0]
-                summary_parts.append(f"• ⚠️  Missing values found in {len(missing_cols)} columns: {missing_cols}")
-        
-        if quality.get('duplicate_rows', 0) > 0:
-            summary_parts.append(f"• ⚠️  {quality['duplicate_rows']} duplicate records detected")
-        else:
-            summary_parts.append("• ✅ No duplicate records found")
-        
-        # Business Insights
-        insights = analysis.get('insights', [])
-        if insights:
-            summary_parts.append("\n💡 KEY BUSINESS INSIGHTS:")
-            for i, insight in enumerate(insights, 1):
-                summary_parts.append(f"• {insight}")
-        
-        # Statistical Highlights
-        stats = analysis.get('statistical_summary', {})
-        if stats.get('numeric_summary'):
-            summary_parts.append("\n📈 STATISTICAL HIGHLIGHTS:")
-            for col, stat_data in list(stats['numeric_summary'].items())[:3]:  # Top 3 numeric columns
-                if isinstance(stat_data, dict) and 'mean' in stat_data:
-                    mean_val = stat_data['mean']
-                    std_val = stat_data.get('std', 0)
-                    summary_parts.append(f"• {col}: Average ${mean_val:.2f}, Variability {std_val:.2f}")
-        
-        # Categorical Analysis
-        if stats.get('categorical_summary'):
-            summary_parts.append("\n🏷️  CATEGORICAL ANALYSIS:")
-            for col, cat_data in list(stats['categorical_summary'].items())[:2]:  # Top 2 categorical columns
-                if isinstance(cat_data, dict) and 'top_values' in cat_data:
-                    top_category = list(cat_data['top_values'].keys())[0] if cat_data['top_values'] else 'N/A'
-                    unique_count = cat_data.get('unique_count', 0)
-                    summary_parts.append(f"• {col}: {unique_count} unique values, most common: '{top_category}'")
-        
-        # Actionable Recommendations
-        recommendations = analysis.get('recommendations', [])
-        if recommendations:
-            summary_parts.append("\n🎯 ACTIONABLE RECOMMENDATIONS:")
-            high_priority = [r for r in recommendations if r.get('priority') == 'High']
-            medium_priority = [r for r in recommendations if r.get('priority') == 'Medium']
+            return results
             
-            if high_priority:
-                summary_parts.append("  HIGH PRIORITY:")
-                for rec in high_priority:
-                    summary_parts.append(f"  • {rec.get('action', 'N/A')} - {rec.get('timeline', 'Immediate')}")
-            
-            if medium_priority:
-                summary_parts.append("  MEDIUM PRIORITY:")
-                for rec in medium_priority:
-                    summary_parts.append(f"  • {rec.get('action', 'N/A')} - {rec.get('timeline', 'Within 2 weeks')}")
-        
-        # Performance Indicators
-        summary_parts.append("\n📊 PERFORMANCE INDICATORS:")
-        if schema.get('row_count', 0) > 1000:
-            summary_parts.append("• 🔥 Large dataset - consider indexing optimization")
-        elif schema.get('row_count', 0) > 100:
-            summary_parts.append("• ✅ Medium dataset - good for analysis")
-        else:
-            summary_parts.append("• 📝 Small dataset - suitable for detailed examination")
-        
-        # Patterns and Trends
-        patterns = analysis.get('patterns', {})
-        if patterns.get('correlations'):
-            strong_pos = patterns['correlations'].get('strong_positive', [])
-            strong_neg = patterns['correlations'].get('strong_negative', [])
-            if strong_pos or strong_neg:
-                summary_parts.append("\n🔗 CORRELATION PATTERNS:")
-                for corr in strong_pos[:2]:  # Top 2 positive correlations
-                    summary_parts.append(f"• Strong positive: {corr.get('pair', 'N/A')} ({corr.get('correlation', 0):.2f})")
-                for corr in strong_neg[:2]:  # Top 2 negative correlations
-                    summary_parts.append(f"• Strong negative: {corr.get('pair', 'N/A')} ({corr.get('correlation', 0):.2f})")
-        
-        # Conclusion
-        summary_parts.append("\n🎉 CONCLUSION:")
-        quality_score = self._calculate_data_quality_score(analysis)
-        if quality_score >= 90:
-            summary_parts.append("• Dataset exhibits excellent quality and is ready for advanced analytics")
-        elif quality_score >= 70:
-            summary_parts.append("• Dataset shows good quality with minor improvements needed")
-        else:
-            summary_parts.append("• Dataset requires data quality improvements before analysis")
-        
-        summary_parts.append("• Regular monitoring and analysis recommended for optimal business insights")
-        summary_parts.append("\n" + "=" * 60)
-        
-        return "\n".join(summary_parts)
+        except Exception as e:
+            return {"error": f"Sensitivity analysis failed: {str(e)}"}
     
-    def _calculate_data_quality_score(self, analysis: Dict) -> float:
-        """Calculate data quality score (0-100)"""
-        quality_metrics = analysis.get('data_quality', {})
-        
-        # Calculate completeness score
-        total_cells = quality_metrics.get('total_rows', 0) * quality_metrics.get('total_columns', 0)
-        missing_cells = sum(quality_metrics.get('missing_values', {}).values())
-        completeness = (total_cells - missing_cells) / total_cells if total_cells > 0 else 0
-        
-        # Calculate uniqueness score
-        total_rows = quality_metrics.get('total_rows', 1)
-        duplicate_rows = quality_metrics.get('duplicate_rows', 0)
-        uniqueness = 1 - (duplicate_rows / total_rows) if total_rows > 0 else 1
-        
-        # Overall score (simple average, can be made more sophisticated)
-        overall_score = (completeness + uniqueness) / 2 * 100
-        
-        return round(overall_score, 2)
+    def _run_scenario_analysis(self, df: pd.DataFrame, independent_vars: List[str], dependent_var: str, scenarios: List[Dict]) -> Dict[str, Any]:
+        """Run comprehensive scenario analysis"""
+        # For now, use what-if simulation logic
+        return self._run_what_if_simulation(df, independent_vars, dependent_var, scenarios)
 
-class QueryGenerator:
-    """Generates optimized SQL queries for analysis"""
-    
-    def __init__(self, db_connector: DatabaseConnector):
-        self.db = db_connector
-    
-    def _format_table_name(self, table_name: str) -> str:
-        """Format table name based on database type"""
-        if self.db.db_type == "postgresql":
-            return f'"{table_name}"'
-        else:
-            return table_name
-    
-    def _format_column_name(self, column_name: str) -> str:
-        """Format column name based on database type"""
-        if self.db.db_type == "postgresql":
-            return f'"{column_name}"'
-        else:
-            return f'"{column_name}"'  # Use quotes for both for consistency
-    
-    def generate_summary_query(self, table_name: str) -> str:
-        """Generate basic summary query"""
-        formatted_table = self._format_table_name(table_name)
-        return f"""
-        -- Basic Summary Query for {table_name}
-        SELECT 
-            COUNT(*) as total_records
-        FROM {formatted_table};
-        """
-    
-    def generate_categorical_analysis(self, table_name: str, column_name: str) -> str:
-        """Generate categorical analysis query"""
-        formatted_table = self._format_table_name(table_name)
-        formatted_column = self._format_column_name(column_name)
-        return f"""
-        -- Categorical Analysis for {column_name}
-        SELECT 
-            {formatted_column},
-            COUNT(*) as count,
-            ROUND(COUNT(*) * 100.0 / (SELECT COUNT(*) FROM {formatted_table}), 2) as percentage
-        FROM {formatted_table}
-        WHERE {formatted_column} IS NOT NULL
-        GROUP BY {formatted_column}
-        ORDER BY count DESC;
-        """
-    
-    def generate_numeric_analysis(self, table_name: str, column_name: str) -> str:
-        """Generate numeric analysis query"""
-        formatted_table = self._format_table_name(table_name)
-        formatted_column = self._format_column_name(column_name)
-        return f"""
-        -- Numeric Analysis for {column_name}
-        SELECT 
-            COUNT(*) as count,
-            MIN({formatted_column}) as min_value,
-            MAX({formatted_column}) as max_value,
-            AVG({formatted_column}) as avg_value,
-            ROUND(AVG({formatted_column}), 2) as avg_rounded
-        FROM {formatted_table}
-        WHERE {formatted_column} IS NOT NULL;
-        """
-    
-    def generate_time_series_analysis(self, table_name: str, date_column: str, value_column: str) -> str:
-        """Generate time series analysis query"""
-        formatted_table = self._format_table_name(table_name)
-        formatted_date = self._format_column_name(date_column)
-        formatted_value = self._format_column_name(value_column)
-        
-        if self.db.db_type == "postgresql":
-            date_func = f"DATE({formatted_date})"
-        else:
-            date_func = f"DATE({formatted_date})"
-        
-        return f"""
-        -- Time Series Analysis
-        SELECT 
-            {date_func} as date,
-            COUNT(*) as transaction_count,
-            AVG({formatted_value}) as avg_value
-        FROM {formatted_table}
-        WHERE {formatted_date} IS NOT NULL
-        GROUP BY {date_func}
-        ORDER BY date;
-        """
-
-class VisualizationGenerator:
-    """Generates matplotlib visualizations based on data analysis"""
-    
+# Main Modular SQL Agent with Enhanced Features
+class SQLAgent:
     def __init__(self):
-        self.viz_config = {}
-        plt.style.use('seaborn-v0_8')
+        # Check if required configuration is available
+        logger.info(Config.GROQ_API_KEY)
+        if not Config.GROQ_API_KEY:
+            raise ValueError("GROQ_API_KEY is not configured. Please set it in your environment variables.")
         
-    def generate_viz_config(self, data: pd.DataFrame, analysis_type: str) -> Dict:
-        """Generate visualization configuration JSON"""
-        config = {
-            'chart_type': self._determine_chart_type(data, analysis_type),
-            'data_format': self._format_data_for_viz(data),
-            'styling': self._get_styling_config(),
-            'interactivity': self._get_interactivity_config(),
-            'layout': self._get_layout_config(data)
-        }
-        return config
+        self.db_manager = DatabaseManager()
+        self.schema_inspector = SchemaInspector(self.db_manager)
+        self.llm = ChatGroq(
+            groq_api_key=Config.GROQ_API_KEY,
+            model_name=Config.GROQ_MODEL,
+            temperature=0.1
+        )
+        
+        # Initialize all sub-agents
+        self.query_generator = SQLQueryGenerator(
+            self.llm, 
+            self.schema_inspector.get_schema_info()
+        )
+        self.query_executor = QueryExecutor(self.db_manager)
+        self.visualization_agent = VisualizationAgent(self.llm)
+        self.reflection_agent = ReflectionAgent(self.llm)
+        self.predictive_agent = PredictiveAnalysisAgent(self.llm)
+        self.prescriptive_agent = PrescriptiveAnalysisAgent(self.llm)
+        self.validation_agent = DataValidationAgent(self.llm)
+        
+        # Router prompt
+        self.router_prompt = PromptTemplates.get_router_prompt()
+        self.general_prompt = PromptTemplates.get_general_response_prompt()
+        
+        # Build the graph
+        self.graph = self._build_graph()
     
-    def _determine_chart_type(self, data: pd.DataFrame, analysis_type: str) -> str:
-        """Determine optimal chart type based on data characteristics"""
-        if analysis_type == 'categorical':
-            if len(data) <= 10:
-                return 'bar_chart'
-            else:
-                return 'horizontal_bar_chart'
-        elif analysis_type == 'numeric':
-            return 'histogram'
-        elif analysis_type == 'time_series':
-            return 'line_chart'
-        elif analysis_type == 'correlation':
-            return 'heatmap'
+    def _build_graph(self) -> StateGraph:
+        workflow = StateGraph(AgentState)
+        
+        # Add nodes
+        workflow.add_node("route_query", self.route_query)
+        workflow.add_node("generate_sql", self.generate_sql)
+        workflow.add_node("execute_sql", self.execute_sql)
+        workflow.add_node("validate_data", self.validate_data)
+        workflow.add_node("improve_query", self.improve_query)
+        workflow.add_node("reflect_response", self.reflect_response)
+        workflow.add_node("refine_response", self.refine_response)
+        workflow.add_node("generate_visualization", self.generate_visualization)
+        workflow.add_node("generate_predictive", self.generate_predictive)
+        workflow.add_node("generate_prescriptive", self.generate_prescriptive)
+        workflow.add_node("format_sql_response", self.format_sql_response)
+        workflow.add_node("handle_general", self.handle_general)
+        workflow.add_node("finalize_response", self.finalize_response)
+        
+        # Add edges
+        workflow.set_entry_point("route_query")
+        workflow.add_conditional_edges(
+            "route_query",
+            self.route_decision,
+            {
+                "sql_query": "generate_sql",
+                "visualization": "generate_sql", 
+                "predictive": "generate_sql",
+                "prescriptive": "generate_sql",
+                "general": "handle_general"
+            }
+        )
+        
+        workflow.add_edge("generate_sql", "execute_sql")
+        workflow.add_edge("execute_sql", "validate_data")
+        
+        workflow.add_conditional_edges(
+            "validate_data",
+            self.check_query_improvement_needed,
+            {
+                "improve": "improve_query",
+                "continue": "format_sql_response"
+            }
+        )
+        
+        workflow.add_edge("improve_query", "execute_sql")  # Re-execute with improved query
+        workflow.add_edge("format_sql_response", "reflect_response")
+        workflow.add_edge("reflect_response", "refine_response")
+        
+        workflow.add_conditional_edges(
+            "refine_response",
+            self.check_analysis_needed,
+            {
+                "predictive": "generate_predictive",
+                "prescriptive": "generate_prescriptive", 
+                "visualization": "generate_visualization",
+                "complete": "finalize_response"
+            }
+        )
+        
+        # Sequential flow for analysis types
+        workflow.add_conditional_edges(
+            "generate_predictive",
+            self.check_next_analysis,
+            {
+                "prescriptive": "generate_prescriptive",
+                "visualization": "generate_visualization",
+                "complete": "finalize_response"
+            }
+        )
+        
+        workflow.add_conditional_edges(
+            "generate_prescriptive", 
+            self.check_next_analysis,
+            {
+                "visualization": "generate_visualization",
+                "complete": "finalize_response"
+            }
+        )
+        
+        workflow.add_edge("generate_visualization", "finalize_response")
+        workflow.add_edge("handle_general", "finalize_response")
+        workflow.add_edge("finalize_response", END)
+        
+        return workflow.compile()
+    
+    @traceable(name="route_query")
+    def route_query(self, state: AgentState) -> AgentState:
+        """Route the query to appropriate handler"""
+        user_input = state["user_input"]
+        
+        # Get session context
+        context = ""
+        if state["session_id"]:
+            session_data = self.db_manager.get_session_context(state["session_id"])
+            context = "\n".join([f"User: {s['user_message']}\nBot: {s['bot_response']}" for s in session_data])
+        
+        # Enhanced routing logic to detect multiple query types
+        query_types = []
+        user_input_lower = user_input.lower()
+        
+        # Check for visualization keywords
+        viz_keywords = ["chart", "graph", "plot", "visualize", "visualization", "show chart", "bar chart", "pie chart"]
+        has_viz_keyword = any(keyword in user_input_lower for keyword in viz_keywords)
+        
+        # Check for SQL/data keywords
+        sql_keywords = ["count", "how many", "show", "list", "average", "sum", "total", "find", "data", "select", "table"]
+        has_sql_keyword = any(keyword in user_input_lower for keyword in sql_keywords)
+        
+        # Check for predictive analysis keywords
+        predictive_keywords = ["forecast", "predict", "prediction", "future", "trend", "project", "estimate", "anticipate", "expect", "model", "arima", "prophet"]
+        has_predictive_keyword = any(keyword in user_input_lower for keyword in predictive_keywords)
+        
+        # Check for prescriptive analysis keywords
+        prescriptive_keywords = ["simulate", "simulation", "what if", "scenario", "optimize", "recommend", "suggest", "best", "improve", "change", "modify", "test"]
+        has_prescriptive_keyword = any(keyword in user_input_lower for keyword in prescriptive_keywords)
+        
+        # Check for general keywords
+        general_keywords = ["hello", "hi", "help", "what can you", "greeting"]
+        has_general_keyword = any(keyword in user_input_lower for keyword in general_keywords)
+        
+        # Determine query types based on keywords
+        if has_general_keyword and not (has_viz_keyword or has_sql_keyword or has_predictive_keyword or has_prescriptive_keyword):
+            query_types = ["general"]
+        elif has_predictive_keyword:
+            query_types = ["sql_query", "predictive"]
+            if has_viz_keyword:
+                query_types.append("visualization")
+        elif has_prescriptive_keyword:
+            query_types = ["sql_query", "prescriptive"]
+            if has_viz_keyword:
+                query_types.append("visualization")
+        elif has_viz_keyword and (has_sql_keyword or any(word in user_input_lower for word in ["data", "show", "display"])):
+            query_types = ["sql_query", "visualization"]
+        elif has_viz_keyword:
+            query_types = ["sql_query", "visualization"]  # Visualization typically needs data first
+        elif has_sql_keyword:
+            query_types = ["sql_query"]
         else:
-            return 'scatter_plot'
-    
-    def _format_data_for_viz(self, data: pd.DataFrame) -> Dict:
-        """Format data for visualization"""
-        return {
-            'x_values': data.iloc[:, 0].tolist() if len(data.columns) > 0 else [],
-            'y_values': data.iloc[:, 1].tolist() if len(data.columns) > 1 else [],
-            'labels': data.columns.tolist(),
-            'data_points': len(data)
-        }
-    
-    def _get_styling_config(self) -> Dict:
-        """Get styling configuration"""
-        return {
-            'color_palette': ['#3498db', '#e74c3c', '#2ecc71', '#f39c12', '#9b59b6'],
-            'figure_size': [12, 8],
-            'title_size': 16,
-            'label_size': 12,
-            'grid': True,
-            'legend': True
-        }
-    
-    def _get_interactivity_config(self) -> Dict:
-        """Get interactivity configuration"""
-        return {
-            'hover_tooltips': True,
-            'zoom_enabled': True,
-            'pan_enabled': True,
-            'selection_enabled': False
-        }
-    
-    def _get_layout_config(self, data: pd.DataFrame) -> Dict:
-        """Get layout configuration"""
-        return {
-            'title': f'Data Analysis Visualization',
-            'x_axis_title': data.columns[0] if len(data.columns) > 0 else 'X Axis',
-            'y_axis_title': data.columns[1] if len(data.columns) > 1 else 'Y Axis',
-            'show_values': True,
-            'rotation': 45 if len(data) > 10 else 0
-        }
-    
-    def create_visualization(self, data: pd.DataFrame, config: Dict) -> plt.Figure:
-        """Create actual matplotlib visualization"""
-        fig, ax = plt.subplots(figsize=config['styling']['figure_size'])
+            query_types = ["general"]
         
-        chart_type = config['chart_type']
-        x_values = config['data_format']['x_values']
-        y_values = config['data_format']['y_values']
-        colors = config['styling']['color_palette']
+        # Fallback to LLM if uncertain
+        if len(query_types) == 0 or (len(query_types) == 1 and query_types[0] == "general" and (has_sql_keyword or has_viz_keyword)):
+            try:
+                # Use LLM to route the query as fallback
+                prompt = self.router_prompt.format(
+                    user_input=user_input,
+                    context=context
+                )
+                
+                response = self.llm.invoke(prompt)
+                response_content = response.content.strip()
+                
+                # Try to parse JSON response
+                import json
+                try:
+                    parsed_types = json.loads(response_content)
+                    if isinstance(parsed_types, list):
+                        query_types = parsed_types
+                    else:
+                        query_types = [parsed_types] if parsed_types in ["sql_query", "visualization", "general"] else ["general"]
+                except:
+                    # Fallback to single type parsing
+                    query_type = response_content.lower()
+                    if query_type in ["sql_query", "visualization", "general"]:
+                        query_types = [query_type]
+                    else:
+                        query_types = ["general"]
+            except:
+                query_types = ["general"]
         
-        if chart_type == 'bar_chart':
-            bars = ax.bar(x_values, y_values, color=colors[0])
-            ax.set_xlabel(config['layout']['x_axis_title'])
-            ax.set_ylabel(config['layout']['y_axis_title'])
+        state["query_types"] = query_types
+        state["context"] = context
+        return state
+    
+    @traceable(name="route_decision")
+    def route_decision(self, state: AgentState) -> str:
+        """Decide the route based on query types"""
+        query_types = state["query_types"]
+        
+        # Priority routing logic
+        if "general" in query_types and len(query_types) == 1:
+            return "general"
+        elif "predictive" in query_types:
+            return "predictive"  # Predictive analysis needs data first
+        elif "prescriptive" in query_types:
+            return "prescriptive"  # Prescriptive analysis needs data first
+        elif "sql_query" in query_types:
+            return "sql_query"  # Start with SQL generation if data is needed
+        else:
+            return "general"
+    
+    @traceable(name="generate_sql")
+    def generate_sql(self, state: AgentState) -> AgentState:
+        """Generate SQL query"""
+        sql_query = self.query_generator.generate_query(
+            state["user_input"], 
+            state["context"]
+        )
+        state["sql_query"] = sql_query
+        state["generated_sql"] = sql_query
+        return state
+    
+    @traceable(name="execute_sql")
+    def execute_sql(self, state: AgentState) -> AgentState:
+        """Execute SQL query"""
+        if state["sql_query"] == "UNSUPPORTED_QUERY":
+            state["query_results"] = {
+                "success": False,
+                "error": "Query not supported. Only simple SELECT queries are allowed.",
+                "data": [],
+                "columns": [],
+                "row_count": 0
+            }
+            state["query_data"] = []
+        else:
+            query_results = self.query_executor.execute_query(state["sql_query"])
+            state["query_results"] = query_results
+            # Extract only the data for the new query_data variable
+            state["query_data"] = query_results.get("data", []) if query_results.get("success") else []
+        
+        state["data_query_result"] = state["query_results"]
+        return state
+    
+    @traceable(name="validate_data")
+    def validate_data(self, state: AgentState) -> AgentState:
+        """Validate data quality and suitability for visualization"""
+        if state["query_results"]["success"] and "visualization" in state["query_types"]:
+            # Validate data for visualization
+            validation_result = self.validation_agent.validate_data_for_visualization(
+                state["query_results"], 
+                state["user_input"]
+            )
+            state["data_validation"] = validation_result
             
-            # Add value labels on bars
-            if config['layout']['show_values']:
-                for bar in bars:
-                    height = bar.get_height()
-                    ax.text(bar.get_x() + bar.get_width()/2., height,
-                           f'{height:.1f}', ha='center', va='bottom')
+            # Add validation feedback to response if there are issues
+            if not validation_result.get("is_valid"):
+                state["final_response"] += f"\n\n**Data Validation:** {validation_result.get('error', 'Data quality issues detected')}"
+            elif validation_result.get("warnings"):
+                warnings_text = "; ".join(validation_result["warnings"])
+                state["final_response"] += f"\n\n**Data Quality Notes:** {warnings_text}"
+            
+            # Add suggestions if any
+            if validation_result.get("suggestions"):
+                suggestions_text = "; ".join(validation_result["suggestions"])
+                state["final_response"] += f"\n\n**Suggestions:** {suggestions_text}"
+        else:
+            state["data_validation"] = None
         
-        elif chart_type == 'line_chart':
-            ax.plot(x_values, y_values, marker='o', color=colors[0], linewidth=2)
-            ax.set_xlabel(config['layout']['x_axis_title'])
-            ax.set_ylabel(config['layout']['y_axis_title'])
+        return state
+    
+    @traceable(name="check_query_improvement_needed")
+    def check_query_improvement_needed(self, state: AgentState) -> str:
+        """Check if query needs improvement based on validation"""
+        validation_result = state.get("data_validation")
         
-        elif chart_type == 'histogram':
-            ax.hist(y_values, bins=20, color=colors[0], alpha=0.7, edgecolor='black')
-            ax.set_xlabel(config['layout']['x_axis_title'])
-            ax.set_ylabel('Frequency')
+        # Skip improvement if not doing visualization or if already improved once
+        if "visualization" not in state["query_types"] or state.get("query_improved", False):
+            return "continue"
         
-        # Apply common styling
-        ax.set_title(config['layout']['title'], fontsize=config['styling']['title_size'])
-        ax.grid(config['styling']['grid'], alpha=0.3)
+        # Improve if validation failed or has significant warnings
+        if validation_result and (
+            not validation_result.get("is_valid") or
+            len(validation_result.get("warnings", [])) > 1
+        ):
+            return "improve"
         
-        if config['layout']['rotation'] > 0:
-            plt.xticks(rotation=config['layout']['rotation'])
+        return "continue"
+    
+    @traceable(name="improve_query")
+    def improve_query(self, state: AgentState) -> AgentState:
+        """Improve SQL query based on validation feedback"""
+        validation_result = state.get("data_validation")
+        if not validation_result:
+            return state
         
-        plt.tight_layout()
-        return fig
+        # Get improved query suggestion
+        improved_query = self.validation_agent.suggest_query_improvements(
+            state["sql_query"],
+            validation_result,
+            state["user_input"]
+        )
+        
+        if improved_query != state["sql_query"]:
+            state["sql_query"] = improved_query
+            state["generated_sql"] = improved_query
+            state["query_improved"] = True
+            logger.info(f"Improved SQL Query: {improved_query}")
+        else:
+            state["query_improved"] = True  # Mark as processed to avoid loops
+        
+        return state
+    
+    @traceable(name="format_sql_response")
+    def format_sql_response(self, state: AgentState) -> AgentState:
+        """Format the SQL response"""
+        results = state["query_results"]
+        
+        if not results["success"]:
+            response = f"Sorry, I couldn't process your query: {results['error']}"
+        else:
+            if results["row_count"] == 0:
+                response = "No data found matching your query."
+            else:
+                response = self._format_data_response(results)
+        
+        state["final_response"] = response
+        return state
+    
+    @traceable(name="reflect_response")
+    def reflect_response(self, state: AgentState) -> AgentState:
+        """Reflect on the response quality"""
+        if state["query_results"]["success"]:
+            feedback = self.reflection_agent.reflect_on_response(
+                state["user_input"],
+                state["sql_query"],
+                state["query_results"],
+                state["final_response"]
+            )
+            state["reflection_feedback"] = feedback
+        else:
+            state["reflection_feedback"] = "APPROVED"
+        return state
+    
+    @traceable(name="refine_response")
+    def refine_response(self, state: AgentState) -> AgentState:
+        """Refine the response based on reflection"""
+        if state["reflection_feedback"] != "APPROVED":
+            refined_response = self.reflection_agent.refine_response(
+                state["user_input"],
+                state["sql_query"],
+                state["query_results"],
+                state["final_response"],
+                state["reflection_feedback"]
+            )
+            state["refined_response"] = refined_response
+            state["final_response"] = refined_response
+        else:
+            state["refined_response"] = state["final_response"]
+        return state
+    
+    @traceable(name="check_analysis_needed")
+    def check_analysis_needed(self, state: AgentState) -> str:
+        """Check what type of analysis is needed"""
+        query_types = state["query_types"]
+        
+        # Priority order: predictive > prescriptive > visualization > complete
+        if "predictive" in query_types:
+            return "predictive"
+        elif "prescriptive" in query_types:
+            return "prescriptive"
+        elif "visualization" in query_types:
+            return "visualization"
+        else:
+            return "complete"
+    
+    @traceable(name="check_next_analysis")
+    def check_next_analysis(self, state: AgentState) -> str:
+        """Check what analysis type should run next in sequence"""
+        query_types = state["query_types"]
+        
+        # Check what analyses have been completed
+        has_predictive = state.get("forecast_results") is not None
+        has_prescriptive = state.get("simulation_results") is not None
+        
+        # Determine next step
+        if "prescriptive" in query_types and not has_prescriptive:
+            return "prescriptive"
+        elif "visualization" in query_types:
+            return "visualization"
+        else:
+            return "complete"
+    
+    @traceable(name="generate_visualization")
+    def generate_visualization(self, state: AgentState) -> AgentState:
+        """Generate visualization"""
+        if state["query_results"]["success"] and state["query_results"]["data"]:
+            # Get validation results
+            validation_result = state.get("data_validation")
+            
+            # Skip visualization if data validation failed
+            if validation_result and not validation_result.get("is_valid"):
+                state["visualization_result"] = None
+                state["final_response"] += f"\n\nVisualization skipped: {validation_result.get('error', 'Data validation failed')}"
+                return state
+            
+            # Generate chart configuration with validation context
+            chart_config = self.visualization_agent.generate_chart_config(
+                state["user_input"],
+                state["query_results"],
+                validation_result
+            )
+            
+            if "error" not in chart_config:
+                # Create visualization with forecast, simulation data, and validation results
+                viz_base64 = self.visualization_agent.create_visualization(
+                    state["query_results"],
+                    chart_config,
+                    state.get("forecast_results"),
+                    state.get("simulation_results"),
+                    validation_result
+                )
+                state["visualization_result"] = viz_base64
+                # If predictive/prescriptive data exists, this is a unified multi-line line chart
+                if (
+                    (state.get("forecast_results") and not state["forecast_results"].get("error"))
+                    or (state.get("simulation_results") and not state["simulation_results"].get("error"))
+                ):
+                    state["chart_type"] = "line"
+                else:
+                    state["chart_type"] = chart_config.get("chart_type", "bar")
+                state["visualization_data"] = chart_config
+                
+                # Add chart recommendations to response
+                if validation_result and validation_result.get("chart_recommendations"):
+                    recommendations_text = "; ".join(validation_result["chart_recommendations"])
+                    state["final_response"] += f"\n\n**Chart Recommendations:** {recommendations_text}"
+            else:
+                state["visualization_result"] = None
+                state["final_response"] += f"\n\nVisualization Error: {chart_config['error']}"
+        else:
+            state["visualization_result"] = None
+        
+        return state
+    
+    @traceable(name="generate_predictive")
+    def generate_predictive(self, state: AgentState) -> AgentState:
+        """Generate predictive analysis"""
+        if state["query_results"]["success"] and state["query_results"]["data"]:
+            # Determine analysis type
+            state["analysis_type"] = "predictive"
+            
+            # Generate forecast configuration
+            forecast_config = self.predictive_agent.generate_forecast_config(
+                state["user_input"],
+                state["query_data"],
+                state["query_results"]["columns"],
+                state["context"]
+            )
+            
+            if "error" not in forecast_config:
+                # Create forecast
+                forecast_results = self.predictive_agent.create_forecast(
+                    state["query_data"],
+                    forecast_config
+                )
+                state["forecast_results"] = forecast_results
+                state["predictive_model"] = forecast_config.get("model_type", "linear")
+                
+                # Update response with predictive insights
+                if "error" not in forecast_results:
+                    forecast_summary = f"\n\n## Predictive Analysis\n"
+                    forecast_summary += f"**Model Used:** {forecast_results.get('model', 'Unknown')}\n"
+                    forecast_summary += f"**Forecast Periods:** {forecast_results.get('periods', 'N/A')}\n"
+                    
+                    if 'forecasts' in forecast_results:
+                        forecasts = forecast_results['forecasts']
+                        if len(forecasts) > 0:
+                            forecast_summary += f"**Next Period Forecast:** {forecasts[0]:.2f}\n"
+                            if len(forecasts) > 1:
+                                forecast_summary += f"**Future Values:** {', '.join([f'{f:.2f}' for f in forecasts[:5]])}\n"
+                    
+                    if 'mae' in forecast_results:
+                        forecast_summary += f"**Model Accuracy (MAE):** {forecast_results['mae']:.2f}\n"
+                    
+                    state["final_response"] += forecast_summary
+                else:
+                    state["final_response"] += f"\n\nPredictive Analysis Error: {forecast_results['error']}"
+            else:
+                state["final_response"] += f"\n\nPredictive Analysis Error: {forecast_config['error']}"
+        else:
+            state["forecast_results"] = None
+        
+        return state
+    
+    @traceable(name="generate_prescriptive")
+    def generate_prescriptive(self, state: AgentState) -> AgentState:
+        """Generate prescriptive analysis"""
+        if state["query_results"]["success"] and state["query_results"]["data"]:
+            # Determine analysis type
+            state["analysis_type"] = "prescriptive"
+            
+            # Generate simulation configuration
+            simulation_config = self.prescriptive_agent.generate_simulation_config(
+                state["user_input"],
+                state["query_data"],
+                state["query_results"]["columns"],
+                state["context"]
+            )
+            
+            if "error" not in simulation_config:
+                # Run simulation
+                simulation_results = self.prescriptive_agent.run_simulation(
+                    state["query_data"],
+                    simulation_config
+                )
+                state["simulation_results"] = simulation_results
+                state["simulation_parameters"] = simulation_config
+                
+                # Update response with prescriptive insights
+                if "error" not in simulation_results:
+                    simulation_summary = f"\n\n## Prescriptive Analysis\n"
+                    simulation_summary += f"**Analysis Type:** {simulation_results.get('simulation_type', 'Unknown')}\n"
+                    
+                    if 'baseline' in simulation_results:
+                        baseline = simulation_results['baseline']
+                        simulation_summary += f"**Baseline Value:** {baseline.get('value', 'N/A')}\n"
+                    
+                    if 'scenarios' in simulation_results:
+                        scenarios = simulation_results['scenarios']
+                        simulation_summary += f"**Scenarios Analyzed:** {len(scenarios)}\n"
+                        
+                        for i, scenario in enumerate(scenarios[:3]):  # Show top 3 scenarios
+                            name = scenario.get('name', f'Scenario {i+1}')
+                            result = scenario.get('result', 'N/A')
+                            change_percent = scenario.get('change_percent', 0)
+                            simulation_summary += f"- **{name}:** {result:.2f} ({change_percent:+.1f}%)\n"
+                    
+                    if 'variables' in simulation_results:
+                        variables = simulation_results['variables']
+                        simulation_summary += f"**Key Variables:** {len(variables)}\n"
+                        for var in variables[:3]:  # Show top 3 variables
+                            var_name = var.get('variable', 'Unknown')
+                            correlation = var.get('correlation', 0)
+                            simulation_summary += f"- **{var_name}:** Correlation = {correlation:.3f}\n"
+                    
+                    state["final_response"] += simulation_summary
+                else:
+                    state["final_response"] += f"\n\nPrescriptive Analysis Error: {simulation_results['error']}"
+            else:
+                state["final_response"] += f"\n\nPrescriptive Analysis Error: {simulation_config['error']}"
+        else:
+            state["simulation_results"] = None
+        
+        return state
 
-class BusinessIntelligenceAgent:
-    """Main AI Agent for Business Intelligence"""
+    @traceable(name="handle_general")
+    def handle_general(self, state: AgentState) -> AgentState:
+        """Handle general queries"""
+        available_tables = list(self.schema_inspector.get_schema_info().keys())
+        
+        prompt = self.general_prompt.format(
+            user_input=state["user_input"],
+            available_tables=", ".join(available_tables),
+            context=state["context"]
+        )
+        
+        response = self.llm.invoke(prompt)
+        state["final_response"] = response.content.strip()
+        return state
     
-    def __init__(self, db_type: str = "sqlite", db_path: str = None, **kwargs):
-        """
-        Initialize Business Intelligence Agent
-        
-        Args:
-            db_type: Database type - 'sqlite' or 'postgresql'
-            db_path: For SQLite - path to database file
-            **kwargs: For PostgreSQL - host, port, database, user, password
-        """
-        self.db_connector = DatabaseConnector(db_type, db_path, **kwargs)
-        self.analyzer = DataAnalyzer(self.db_connector)
-        self.query_generator = QueryGenerator(self.db_connector)
-        self.viz_generator = VisualizationGenerator()
-        
-    def initialize(self) -> bool:
-        """Initialize the agent and database connection"""
-        success = self.db_connector.connect()
-        if success:
-            self._create_sample_data()
-        return success
+    @traceable(name="finalize_response")
+    def finalize_response(self, state: AgentState) -> AgentState:
+        """Finalize the response with markdown formatting"""
+        state["markdown_result"] = self._format_markdown_response(state)
+        return state
     
-    def _create_sample_data(self):
-        """Create sample transaction data for demonstration"""
-        cursor = self.db_connector.connection.cursor()
+    def _format_data_response(self, results: Dict[str, Any]) -> str:
+        """Format data results into a readable response"""
+        data = results["data"]
+        columns = results["columns"]
         
-        if self.db_connector.db_type == "sqlite":
-            # SQLite table creation
-            cursor.execute('''
-            CREATE TABLE IF NOT EXISTS TransactionData (
-                TransactionID INTEGER PRIMARY KEY,
-                TransactionType TEXT,
-                Amount REAL,
-                TransactionStatus TEXT,
-                FraudFlag TEXT,
-                Timestamp TEXT,
-                DeviceUsed TEXT,
-                GeolocationLatLong TEXT,
-                LatencyMs INTEGER,
-                SliceBandwidthMbps REAL
-            )
-            ''')
+        if len(data) == 1 and len(columns) == 1:
+            # Single value result
+            return f"Result: {data[0][columns[0]]}"
+        else:
+            # Multiple rows/columns - create table
+            response_parts = [f"Found {results['row_count']} result(s):"]
             
-            # Insert sample data for SQLite
-            sample_data = [
-                (1, 'Transfer', 1500.00, 'Success', 'False', '2024-01-01 10:00:00', 'Mobile', '40.7128,-74.0060', 45, 50.5),
-                (2, 'Deposit', 2000.00, 'Success', 'False', '2024-01-01 11:00:00', 'Desktop', '34.0522,-118.2437', 32, 75.2),
-                (3, 'Withdrawal', 500.00, 'Failed', 'True', '2024-01-01 12:00:00', 'Mobile', '41.8781,-87.6298', 156, 25.1),
-                (4, 'Transfer', 750.00, 'Success', 'False', '2024-01-01 13:00:00', 'Tablet', '29.7604,-95.3698', 67, 45.8),
-                (5, 'Deposit', 3000.00, 'Success', 'True', '2024-01-01 14:00:00', 'Desktop', '40.7128,-74.0060', 234, 15.3),
-            ]
-            
-            cursor.executemany('''
-            INSERT OR REPLACE INTO TransactionData VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-            ''', sample_data)
-            
-        elif self.db_connector.db_type == "postgresql":
-            # First, clear any existing data that might be corrupted
-            cursor.execute('DROP TABLE IF EXISTS "TransactionData" CASCADE;')
-            
-            # PostgreSQL table creation with proper case handling
-            cursor.execute('''
-            CREATE TABLE "TransactionData" (
-                "TransactionID" SERIAL PRIMARY KEY,
-                "TransactionType" VARCHAR(50),
-                "Amount" DECIMAL(10,2),
-                "TransactionStatus" VARCHAR(20),
-                "FraudFlag" VARCHAR(5),
-                "Timestamp" TIMESTAMP,
-                "DeviceUsed" VARCHAR(20),
-                "GeolocationLatLong" VARCHAR(50),
-                "LatencyMs" INTEGER,
-                "SliceBandwidthMbps" DECIMAL(5,1)
-            )
-            ''')
-            
-            # Clear any existing data first
-            cursor.execute('DELETE FROM "TransactionData"')
-            
-            # Insert fresh sample data for PostgreSQL
-            sample_data = [
-                (1, 'Transfer', 1500.00, 'Success', 'False', '2024-01-01 10:00:00', 'Mobile', '40.7128,-74.0060', 45, 50.5),
-                (2, 'Deposit', 2000.00, 'Success', 'False', '2024-01-01 11:00:00', 'Desktop', '34.0522,-118.2437', 32, 75.2),
-                (3, 'Withdrawal', 500.00, 'Failed', 'True', '2024-01-01 12:00:00', 'Mobile', '41.8781,-87.6298', 156, 25.1),
-                (4, 'Transfer', 750.00, 'Success', 'False', '2024-01-01 13:00:00', 'Tablet', '29.7604,-95.3698', 67, 45.8),
-                (5, 'Deposit', 3000.00, 'Success', 'True', '2024-01-01 14:00:00', 'Desktop', '40.7128,-74.0060', 234, 15.3),
-                (6, 'Payment', 250.00, 'Success', 'False', '2024-01-01 15:00:00', 'Mobile', '37.7749,-122.4194', 78, 42.3),
-                (7, 'Transfer', 800.00, 'Failed', 'True', '2024-01-01 16:00:00', 'Desktop', '40.7128,-74.0060', 298, 18.7),
-                (8, 'Deposit', 1200.00, 'Success', 'False', '2024-01-01 17:00:00', 'Tablet', '34.0522,-118.2437', 56, 65.1),
-                (9, 'Withdrawal', 300.00, 'Success', 'False', '2024-01-01 18:00:00', 'Mobile', '41.8781,-87.6298', 89, 38.9),
-                (10, 'Payment', 450.00, 'Success', 'False', '2024-01-01 19:00:00', 'Desktop', '29.7604,-95.3698', 34, 72.4),
-            ]
-            
-            for data in sample_data:
-                cursor.execute('''
-                INSERT INTO "TransactionData" ("TransactionID", "TransactionType", "Amount", "TransactionStatus", 
-                                              "FraudFlag", "Timestamp", "DeviceUsed", "GeolocationLatLong", 
-                                              "LatencyMs", "SliceBandwidthMbps") 
-                VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
-                ON CONFLICT ("TransactionID") DO UPDATE SET
-                    "TransactionType" = EXCLUDED."TransactionType",
-                    "Amount" = EXCLUDED."Amount",
-                    "TransactionStatus" = EXCLUDED."TransactionStatus",
-                    "FraudFlag" = EXCLUDED."FraudFlag",
-                    "Timestamp" = EXCLUDED."Timestamp",
-                    "DeviceUsed" = EXCLUDED."DeviceUsed",
-                    "GeolocationLatLong" = EXCLUDED."GeolocationLatLong",
-                    "LatencyMs" = EXCLUDED."LatencyMs",
-                    "SliceBandwidthMbps" = EXCLUDED."SliceBandwidthMbps"
-                ''', data)
-        
-        self.db_connector.connection.commit()
-        cursor.close()
-        print("✅ Sample data created successfully")
+            if data and columns:
+                # Create markdown table
+                header = f"| {' | '.join(columns)} |"
+                separator = f"| {' | '.join(['---'] * len(columns))} |"
+                response_parts.append(header)
+                response_parts.append(separator)
+
+                for row in data[:10]:  # Limit to 10 rows
+                    row_str = [str(row[col]) for col in columns]
+                    response_parts.append(f"| {' | '.join(row_str)} |")
+                
+                if results['row_count'] > 10:
+                    response_parts.append(f"\n... and {results['row_count'] - 10} more rows.")
+
+                return "\n".join(response_parts)
+            else:
+                return "No data found or columns are missing."
     
-    def get_available_tables(self) -> List[str]:
-        """Get list of available tables for analysis"""
-        return self.db_connector.get_tables()
-    
-    def analyze_table(self, table_name: str) -> Dict:
-        """Perform comprehensive table analysis"""
-        print(f"🔍 Analyzing table: {table_name}")
-        analysis = self.analyzer.analyze_table(table_name)
-        return analysis
-    
-    def generate_business_report(self, table_name: str) -> Dict:
-        """Generate comprehensive business report"""
-        analysis = self.analyze_table(table_name)
+    def _format_markdown_response(self, state: AgentState) -> str:
+        """Format the complete response in markdown"""
+        markdown_parts = []
         
-        if 'error' in analysis:
-            return analysis
+        # Add main response
+        markdown_parts.append(f"## Response\n{state['final_response']}")
         
-        # Generate SQL queries for different analysis types
-        queries = {
-            'summary': self.query_generator.generate_summary_query(table_name),
-            'categorical_queries': {},
-            'numeric_queries': {}
+        # Add SQL query if available
+        if state.get("generated_sql") and state["generated_sql"] != "UNSUPPORTED_QUERY":
+            markdown_parts.append(f"\n## Generated SQL\n```sql\n{state['generated_sql']}\n```")
+        
+        # Add reflection feedback if available
+        if state.get("reflection_feedback") and state["reflection_feedback"] != "APPROVED":
+            markdown_parts.append(f"\n## Analysis Notes\n{state['reflection_feedback']}")
+        
+        # Add visualization info if available
+        if state.get("visualization_result"):
+            markdown_parts.append(f"\n## Visualization\nChart Type: {state.get('chart_type', 'Unknown')}")
+        
+        return "\n".join(markdown_parts)
+    
+    @traceable(name="bisee-rag-agent")
+    def process_message(self, message: str, session_id: Optional[str] = None) -> Dict[str, Any]:
+        """Process a message and return structured response"""
+        if not session_id:
+            session_id = str(uuid.uuid4())
+        
+        initial_state = AgentState(
+            messages=[HumanMessage(content=message)],
+            user_input=message,
+            session_id=session_id,
+            query_types=[],  # Changed from query_type to query_types
+            context="",
+            sql_query="",
+            query_results={},
+            query_data=[],  # New field for only query result data
+            final_response="",
+            generated_sql=None,
+            data_query_result=None,
+            markdown_result=None,
+            visualization_result=None,
+            reflection_feedback=None,
+            refined_response=None,
+            chart_type=None,
+            visualization_data=None,
+            # New fields for predictive and prescriptive analysis
+            analysis_type=None,
+            forecast_results=None,
+            simulation_results=None,
+            predictive_model=None,
+            simulation_parameters=None,
+            data_validation=None
+        )
+        
+        # Run the graph
+        final_state = self.graph.invoke(initial_state)
+        
+        # Save to session
+        query_type_str = ", ".join(final_state["query_types"]) if final_state["query_types"] else "general"
+        self.db_manager.save_session(
+            session_id,
+            message,
+            final_state["final_response"],
+            query_type_str
+        )
+
+        result = {
+            "response": final_state["final_response"],
+            "session_id": session_id,
+            "query_types": final_state["query_types"],  # Return as array
+            "query_type": query_type_str,  # Keep for backward compatibility
+            "user_input": message,
+            "generated_sql": final_state.get("generated_sql"),
+            "data_query_result": final_state.get("data_query_result"),
+            "markdown_result": final_state.get("markdown_result"),
+            "visualization_result": final_state.get("visualization_result"),
+            # New analysis results
+            "analysis_type": final_state.get("analysis_type"),
+            "forecast_results": final_state.get("forecast_results"),
+            "simulation_results": final_state.get("simulation_results"),
+            "predictive_model": final_state.get("predictive_model"),
+            "simulation_parameters": final_state.get("simulation_parameters")
         }
+
+        return result
+
+def show_db_config_form():
+    st.header("Configure Database Connection")
+    with st.form("db_config_form"):
+        host = st.text_input("Host", value="localhost")
+        port = st.number_input("Port", value=5432)
+        username = st.text_input("Username", value="user")
+        password = st.text_input("Password", type="password", value="password")
+        database = st.text_input("Database", value="dbname")
         
-        # Get actual data for visualization
-        data = self.db_connector.get_sample_data(table_name, 100)
+        submitted = st.form_submit_button("Connect")
+        if submitted:
+            postgres_url = f"postgresql://{username}:{password}@{host}:{port}/{database}"
+            try:
+                with st.spinner("Connecting to database..."):
+                    conn = psycopg2.connect(postgres_url)
+                    conn.close()
+                
+                st.success("Database connection successful!")
+                Config.POSTGRES_URL = postgres_url
+                st.session_state.db_connected = True
+                st.session_state.agent = SQLAgent()
+                st.rerun()
+
+            except Exception as e:
+                st.error(f"Database connection failed: {e}")
+
+def show_chat_interface():
+    st.title("Advanced Analytics SQL Agent - Descriptive, Predictive & Prescriptive Analysis")
+
+    # This code will fetch and display the app's public IP address
+    try:
+        ip = requests.get('https://api.ipify.org').text
+        st.info(f"The public IP address of this Streamlit app is: **{ip}**")
+    except Exception as e:
+        st.error(f"Could not get IP address. Error: {e}")
+
+    if "messages" not in st.session_state:
+        st.session_state.messages = []
+    if "session_id" not in st.session_state:
+        st.session_state.session_id = str(uuid.uuid4())
+
+    # Display chat history
+    for message in st.session_state.messages:
+        with st.chat_message(message["role"]):
+            if message["role"] == "assistant":
+                # Display structured response
+                if "response" in message:
+                    st.markdown(message["response"])
+                
+                # Display SQL query if available
+                if message.get("generated_sql") and message["generated_sql"] != "UNSUPPORTED_QUERY":
+                    with st.expander("Generated SQL Query"):
+                        st.code(message["generated_sql"], language="sql")
+                
+                # Display data results if available
+                if message.get("data_query_result") and message["data_query_result"].get("success"):
+                    data_result = message["data_query_result"]
+                    if data_result.get("data"):
+                        with st.expander("Query Results"):
+                            # Convert to DataFrame for better display
+                            df = pd.DataFrame(data_result["data"])
+                            st.dataframe(df)
+                            st.caption(f"Total rows: {data_result['row_count']}")
+                
+                # Display visualization if available
+                if message.get("visualization_result"):
+                    with st.expander("Visualization"):
+                        # Decode base64 image
+                        import base64
+                        from io import BytesIO
+                        from PIL import Image
+                        
+                        image_data = base64.b64decode(message["visualization_result"])
+                        image = Image.open(BytesIO(image_data))
+                        st.image(image, caption="Data Visualization", use_column_width=True)
+                
+                # Display predictive analysis if available
+                if message.get("forecast_results") and "error" not in message["forecast_results"]:
+                    with st.expander("Predictive Analysis Results"):
+                        forecast_results = message["forecast_results"]
+                        st.subheader(f"Model: {forecast_results.get('model', 'Unknown')}")
+                        
+                        if 'forecasts' in forecast_results:
+                            st.write("**Forecasted Values:**")
+                            forecasts = forecast_results['forecasts'][:10]  # Show first 10
+                            forecast_df = pd.DataFrame({
+                                'Period': range(1, len(forecasts) + 1),
+                                'Forecast': forecasts
+                            })
+                            st.dataframe(forecast_df)
+                        
+                        if 'mae' in forecast_results:
+                            st.metric("Model Accuracy (MAE)", f"{forecast_results['mae']:.2f}")
+                        
+                        if 'historical_values' in forecast_results:
+                            st.write("**Historical vs Forecasted Trend:**")
+                            historical = forecast_results['historical_values']
+                            forecasts = forecast_results.get('forecasts', [])
+                            
+                            # Create trend visualization
+                            fig, ax = plt.subplots(figsize=(10, 4))
+                            hist_x = range(len(historical))
+                            forecast_x = range(len(historical), len(historical) + len(forecasts))
+                            
+                            ax.plot(hist_x, historical, label='Historical', marker='o')
+                            ax.plot(forecast_x, forecasts, label='Forecast', marker='s', linestyle='--')
+                            ax.legend()
+                            ax.set_title('Historical Data vs Forecast')
+                            st.pyplot(fig)
+                            plt.close()
+                
+                # Display prescriptive analysis if available
+                if message.get("simulation_results") and "error" not in message["simulation_results"]:
+                    with st.expander("Prescriptive Analysis Results"):
+                        simulation_results = message["simulation_results"]
+                        st.subheader(f"Analysis: {simulation_results.get('simulation_type', 'Unknown')}")
+                        
+                        if 'baseline' in simulation_results:
+                            baseline = simulation_results['baseline']
+                            st.metric("Baseline Value", f"{baseline.get('value', 'N/A')}")
+                        
+                        if 'scenarios' in simulation_results:
+                            st.write("**Scenario Analysis:**")
+                            scenarios_data = []
+                            for scenario in simulation_results['scenarios']:
+                                scenarios_data.append({
+                                    'Scenario': scenario.get('name', 'Unknown'),
+                                    'Result': scenario.get('result', 0),
+                                    'Change (%)': f"{scenario.get('change_percent', 0):+.1f}%",
+                                    'Description': scenario.get('description', '')
+                                })
+                            
+                            if scenarios_data:
+                                scenarios_df = pd.DataFrame(scenarios_data)
+                                st.dataframe(scenarios_df)
+                        
+                        if 'variables' in simulation_results:
+                            st.write("**Variable Sensitivity:**")
+                            variables_data = []
+                            for var in simulation_results['variables']:
+                                variables_data.append({
+                                    'Variable': var.get('variable', 'Unknown'),
+                                    'Correlation': f"{var.get('correlation', 0):.3f}"
+                                })
+                            
+                            if variables_data:
+                                variables_df = pd.DataFrame(variables_data)
+                                st.dataframe(variables_df)
+                
+                # Display markdown formatted response
+                if message.get("markdown_result"):
+                    with st.expander("Detailed Analysis"):
+                        st.markdown(message["markdown_result"])
+            else:
+                st.markdown(message["content"])
+
+    # Chat input
+    if prompt := st.chat_input("Ask questions, request visualizations, get forecasts, or run simulations on your data..."):
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        with st.chat_message("assistant"):
+            with st.spinner("Processing your request..."):
+                agent = st.session_state.agent
+                result = agent.process_message(prompt, st.session_state.session_id)
+                
+                # Display main response
+                st.markdown(result["response"])
+                
+                # Display SQL query if available
+                if result.get("generated_sql") and result["generated_sql"] != "UNSUPPORTED_QUERY":
+                    with st.expander("Generated SQL Query"):
+                        st.code(result["generated_sql"], language="sql")
+                
+                # Display data results if available
+                if result.get("data_query_result") and result["data_query_result"].get("success"):
+                    data_result = result["data_query_result"]
+                    if data_result.get("data"):
+                        with st.expander("Query Results"):
+                            # Convert to DataFrame for better display
+                            df = pd.DataFrame(data_result["data"])
+                            st.dataframe(df)
+                            st.caption(f"Total rows: {data_result['row_count']}")
+                
+                # Display visualization if available
+                if result.get("visualization_result"):
+                    with st.expander("Visualization"):
+                        # Decode base64 image
+                        import base64
+                        from io import BytesIO
+                        from PIL import Image
+                        
+                        image_data = base64.b64decode(result["visualization_result"])
+                        image = Image.open(BytesIO(image_data))
+                        st.image(image, caption="Data Visualization", use_column_width=True)
+                
+                # Display markdown formatted response
+                if result.get("markdown_result"):
+                    with st.expander("Detailed Analysis"):
+                        st.markdown(result["markdown_result"])
+                
+                # Display predictive analysis if available
+                if result.get("forecast_results") and "error" not in result["forecast_results"]:
+                    with st.expander("Predictive Analysis Results"):
+                        forecast_results = result["forecast_results"]
+                        st.subheader(f"Model: {forecast_results.get('model', 'Unknown')}")
+                        
+                        if 'forecasts' in forecast_results:
+                            st.write("**Forecasted Values:**")
+                            forecasts = forecast_results['forecasts'][:10]  # Show first 10
+                            forecast_df = pd.DataFrame({
+                                'Period': range(1, len(forecasts) + 1),
+                                'Forecast': forecasts
+                            })
+                            st.dataframe(forecast_df)
+                        
+                        if 'mae' in forecast_results:
+                            st.metric("Model Accuracy (MAE)", f"{forecast_results['mae']:.2f}")
+                
+                # Display prescriptive analysis if available
+                if result.get("simulation_results") and "error" not in result["simulation_results"]:
+                    with st.expander("Prescriptive Analysis Results"):
+                        simulation_results = result["simulation_results"]
+                        st.subheader(f"Analysis: {simulation_results.get('simulation_type', 'Unknown')}")
+                        
+                        if 'baseline' in simulation_results:
+                            baseline = simulation_results['baseline']
+                            st.metric("Baseline Value", f"{baseline.get('value', 'N/A')}")
+                        
+                        if 'scenarios' in simulation_results:
+                            st.write("**Scenario Analysis:**")
+                            scenarios_data = []
+                            for scenario in simulation_results['scenarios']:
+                                scenarios_data.append({
+                                    'Scenario': scenario.get('name', 'Unknown'),
+                                    'Result': scenario.get('result', 0),
+                                    'Change (%)': f"{scenario.get('change_percent', 0):+.1f}%"
+                                })
+                            
+                            if scenarios_data:
+                                scenarios_df = pd.DataFrame(scenarios_data)
+                                st.dataframe(scenarios_df)
         
-        # Generate visualizations
-        visualizations = []
-        
-        # Categorical analysis
-        categorical_cols = data.select_dtypes(include=['object']).columns
-        for col in categorical_cols:
-            query = self.query_generator.generate_categorical_analysis(table_name, col)
-            queries['categorical_queries'][col] = query
-            
-            # Generate visualization
-            viz_data = self.db_connector.execute_query(query)
-            if not viz_data.empty:
-                viz_config = self.viz_generator.generate_viz_config(viz_data, 'categorical')
-                viz_config['title'] = f'{col} Distribution'
-                visualizations.append({
-                    'type': 'categorical',
-                    'column': col,
-                    'config': viz_config
-                })
-        
-        # Numeric analysis
-        numeric_cols = data.select_dtypes(include=[np.number]).columns
-        for col in numeric_cols:
-            query = self.query_generator.generate_numeric_analysis(table_name, col)
-            queries['numeric_queries'][col] = query
-            
-            # Generate visualization
-            viz_data = data[[col]].dropna()
-            if not viz_data.empty:
-                viz_config = self.viz_generator.generate_viz_config(viz_data, 'numeric')
-                viz_config['title'] = f'{col} Distribution'
-                visualizations.append({
-                    'type': 'numeric',
-                    'column': col,
-                    'config': viz_config
-                })
-        
-        # Compile final report
-        report = {
-            'executive_summary': self._generate_executive_summary(analysis),
-            'data_insights': analysis['insights'],
-            'sql_queries': queries,
-            'visualizations': visualizations,
-            'recommendations': analysis['recommendations'],
-            'raw_analysis': analysis
-        }
-        
-        return report
-    
-    def _generate_executive_summary(self, analysis: Dict) -> Dict:
-        """Generate executive summary from analysis"""
-        schema = analysis['schema']
-        insights = analysis['insights']
-        
-        summary = {
-            'total_records': schema['row_count'],
-            'data_dimensions': len(schema['columns']),
-            'key_findings': insights[:3],  # Top 3 insights
-            'data_quality_score': self.analyzer._calculate_data_quality_score(analysis),
-            'business_impact': 'Medium to High'  # This could be more sophisticated
-        }
-        
-        return summary
-    
-    def create_visualization(self, viz_config: Dict) -> plt.Figure:
-        """Create matplotlib visualization from config"""
-        # Create sample data based on config
-        data_format = viz_config['data_format']
-        sample_data = pd.DataFrame({
-            'x': data_format['x_values'],
-            'y': data_format['y_values'] if data_format['y_values'] else data_format['x_values']
+        # Save the complete result to session
+        st.session_state.messages.append({
+            "role": "assistant",
+            "response": result["response"],
+            "generated_sql": result.get("generated_sql"),
+            "data_query_result": result.get("data_query_result"),
+            "markdown_result": result.get("markdown_result"),
+            "visualization_result": result.get("visualization_result"),
+            "forecast_results": result.get("forecast_results"),
+            "simulation_results": result.get("simulation_results"),
+            "analysis_type": result.get("analysis_type")
         })
-        
-        return self.viz_generator.create_visualization(sample_data, viz_config)
 
 def main():
-    """Main application entry point"""
-    print("🚀 Business Intelligence AI Agent System")
-    print("=" * 50)
-    
-    # Example 1: SQLite (default)
-    # print("\n📊 Example 1: Using SQLite Database")
-    # agent_sqlite = BusinessIntelligenceAgent(db_type="sqlite", db_path="business_data.db")
-    
-    # if not agent_sqlite.initialize():
-    #     print("❌ Failed to initialize SQLite agent")
-    #     return
-    
-    # Example 2: PostgreSQL (uncomment and configure as needed)
-    print("\n🐘 Example 2: Using PostgreSQL Database")
-    agent_postgres = BusinessIntelligenceAgent(
-        db_type="postgresql",
-        host="localhost",
-        port=5432,
-        database="db_bisee",
-        user="postgres",
-        password="password"
-    )
-    
-    if not agent_postgres.initialize():
-        print("❌ Failed to initialize PostgreSQL agent")
-    else:
-        postgres_tables = agent_postgres.get_available_tables()
-        print(f"📊 PostgreSQL tables: {postgres_tables}")
-    
-    # Continue with SQLite example
-    # agent = agent_sqlite
+    st.set_page_config(page_title="Bisee Chatbot", layout="wide")
 
-    agent = agent_postgres
-    
-    # Get available tables
-    tables = agent.get_available_tables()
-    print(f"📊 Available tables: {tables}")
-    
-    # Analyze the first table (or user can select)
-    if tables:
-        table_name = tables[0]  # You can modify this to allow user selection
-        print(f"\n🔍 Analyzing table: {table_name}")
-        
-        # Generate comprehensive business report
-        report = agent.generate_business_report(table_name)
-        
-        # Display results
-        print("\n📋 EXECUTIVE SUMMARY")
-        print("-" * 30)
-        summary = report['executive_summary']
-        print(f"Total Records: {summary['total_records']}")
-        print(f"Data Quality Score: {summary['data_quality_score']}%")
-        print(f"Key Findings:")
-        for i, finding in enumerate(summary['key_findings'], 1):
-            print(f"  {i}. {finding}")
-        
-        print("\n💡 RECOMMENDATIONS")
-        print("-" * 30)
-        for rec in report['recommendations']:
-            print(f"• {rec['action']} ({rec['priority']} priority)")
-            print(f"  {rec['details']}")
-        
-        print("\n📊 VISUALIZATION CONFIGS")
-        print("-" * 30)
-        for viz in report['visualizations']:
-            print(f"• {viz['type'].title()} chart for {viz['column']}")
-            print(f"  Config: {json.dumps(viz['config'], indent=2)}")
-        
-        # Create and show a sample visualization
-        if report['visualizations']:
-            print("\n🎨 Creating sample visualization...")
-            first_viz = report['visualizations'][0]
-            fig = agent.create_visualization(first_viz['config'])
-            plt.show()
-    
-    print("\n✅ Analysis complete!")
+    if "db_connected" not in st.session_state:
+        st.session_state.db_connected = False
+
+    if not st.session_state.db_connected:
+        show_db_config_form()
+    else:
+        show_chat_interface()
 
 if __name__ == "__main__":
     main()
